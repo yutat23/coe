@@ -491,7 +491,6 @@ func runClient() {
 	go func() {
 		defer wg.Done()
 		buffer := make([]byte, bufferSize)
-		var messageBuffer strings.Builder
 
 		for {
 			n, err := conn.Read(buffer)
@@ -504,32 +503,23 @@ func runClient() {
 				continue
 			}
 
-			// Process received data
+			// Process received data - display as-is without waiting for terminator
+			// Response messages don't use the terminator character
 			data := buffer[:n]
-			for _, b := range data {
-				if b == terminatorBytes[0] {
-					// Display message when terminator is found
-					message := messageBuffer.String()
-					if message != "" {
-						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-						messageBytes := []byte(message)
-						hexData := fmt.Sprintf("%x", messageBytes)
-						if colorEnabled {
-							fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
-								colorGreen, colorReset,
-								colorYellow, timestamp, colorReset,
-								message,
-								colorCyan, len(messageBytes), colorReset,
-								colorPurple, hexData, colorReset)
-						} else {
-							fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
-								timestamp, message, len(messageBytes), hexData)
-						}
-					}
-					messageBuffer.Reset()
-				} else {
-					messageBuffer.WriteByte(b)
-				}
+			message := string(data)
+			timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+			messageBytes := []byte(message)
+			hexData := fmt.Sprintf("%x", messageBytes)
+			if colorEnabled {
+				fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+					colorGreen, colorReset,
+					colorYellow, timestamp, colorReset,
+					message,
+					colorCyan, len(messageBytes), colorReset,
+					colorPurple, hexData, colorReset)
+			} else {
+				fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+					timestamp, message, len(messageBytes), hexData)
 			}
 		}
 	}()
