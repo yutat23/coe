@@ -70,14 +70,15 @@ func usage() {
 	showLogo()
 	fmt.Println("")
 	fmt.Println("USAGE")
-	fmt.Println("  Server mode:   coe -s, --server <port> [terminator] [--no-echo] [--buffer-size <size>] [--color]")
-	fmt.Println("  Client mode    coe -c, --client <IP> <port> <terminator> [--buffer-size <size>] [--color]")
+	fmt.Println("  Server mode:   coe -s, --server <port> [terminator] [--no-echo] [--buffer-size <size>] [--color] [--no-color]")
+	fmt.Println("  Client mode    coe -c, --client <IP> <port> <terminator> [--buffer-size <size>] [--color] [--no-color]")
 	fmt.Println("")
 	fmt.Println("OPTIONS")
 	fmt.Println("Terminator: LF (0A) or CR (0D) - Default is LF")
 	fmt.Println("--no-echo        Disable echo back (Server mode only)")
 	fmt.Println("--buffer-size    Specify buffer size (bytes) - Default is 1024")
-	fmt.Println("--color          Enable colored output for better readability")
+	fmt.Println("--color          Enable colored output for better readability (Default: enabled)")
+	fmt.Println("--no-color       Disable colored output")
 	fmt.Println("")
 	fmt.Println("COLOR CODING (when --color is enabled)")
 	fmt.Println("  Blue    - Client IP addresses")
@@ -93,13 +94,15 @@ func usage() {
 	fmt.Println("  coe -s 8080 LF --no-echo")
 	fmt.Println("  coe -s 8080 --buffer-size 2048")
 	fmt.Println("  coe -s 8080 --color")
+	fmt.Println("  coe -s 8080 --no-color")
 	fmt.Println("  coe -c 127.0.0.1 8080 LF")
 	fmt.Println("  coe --client 192.168.1.100 8080 CR --buffer-size 512 --color")
+	fmt.Println("  coe --client 192.168.1.100 8080 CR --no-color")
 }
 
 func runServer() {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: -s, --server <port> [terminator] [--no-echo] [--buffer-size <size>] [--color]")
+		fmt.Println("Usage: -s, --server <port> [terminator] [--no-echo] [--buffer-size <size>] [--color] [--no-color]")
 		return
 	}
 
@@ -107,7 +110,7 @@ func runServer() {
 	terminator := "LF" // Default
 	echoEnabled := true // Default echo enabled
 	bufferSize := 1024 // Default buffer size
-	colorEnabled = false // Default color disabled
+	colorEnabled = true // Default color enabled
 	
 	// Parse arguments
 	for i := 3; i < len(os.Args); i++ {
@@ -131,6 +134,8 @@ func runServer() {
 			}
 		} else if arg == "--color" {
 			colorEnabled = true
+		} else if arg == "--no-color" {
+			colorEnabled = false
 		} else if terminator == "LF" && (arg == "LF" || arg == "CR") {
 			terminator = arg
 		}
@@ -427,7 +432,7 @@ func printServerHelp() {
 
 func runClient() {
 	if len(os.Args) < 5 {
-		fmt.Println("Usage: -c, --client <IP> <port> <terminator> [--buffer-size <size>] [--color]")
+		fmt.Println("Usage: -c, --client <IP> <port> <terminator> [--buffer-size <size>] [--color] [--no-color]")
 		fmt.Println("Terminator: LF (0A) or CR (0D)")
 		return
 	}
@@ -435,7 +440,7 @@ func runClient() {
 	address := os.Args[2] + ":" + os.Args[3]
 	terminator := os.Args[4]
 	bufferSize := 1024 // Default buffer size
-	colorEnabled = false // Default color disabled
+	colorEnabled = true // Default color enabled
 	
 	// Parse arguments
 	for i := 5; i < len(os.Args); i++ {
@@ -457,6 +462,8 @@ func runClient() {
 			}
 		} else if arg == "--color" {
 			colorEnabled = true
+		} else if arg == "--no-color" {
+			colorEnabled = false
 		}
 	}
 	
