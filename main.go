@@ -588,6 +588,9 @@ func runClient() {
 		os.Exit(0)
 	}()
 
+	// Mutex for output synchronization
+	var outputMutex sync.Mutex
+
 	// Receive-only goroutine
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -607,6 +610,7 @@ func runClient() {
 				// Timeout occurred - display buffered data if any
 				message := messageBuffer.String()
 				if message != "" {
+					outputMutex.Lock()
 					fmt.Print("\r\033[K") // Clear current line
 					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 					messageBytes := []byte(message)
@@ -623,6 +627,7 @@ func runClient() {
 							timestamp, message, len(messageBytes), hexData)
 					}
 					fmt.Print("Send> ") // Re-display prompt
+					outputMutex.Unlock()
 					messageBuffer.Reset()
 				}
 				continue // Continue reading
@@ -632,6 +637,7 @@ func runClient() {
 				// Display any remaining buffered data before returning
 				message := messageBuffer.String()
 				if message != "" {
+					outputMutex.Lock()
 					fmt.Print("\r\033[K") // Clear current line
 					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 					messageBytes := []byte(message)
@@ -647,9 +653,12 @@ func runClient() {
 						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
 							timestamp, message, len(messageBytes), hexData)
 					}
+					outputMutex.Unlock()
 				}
+				outputMutex.Lock()
 				fmt.Print("\r\033[K") // Clear current line before error message
 				fmt.Println("Receive error:", err)
+				outputMutex.Unlock()
 				return
 			}
 
@@ -657,6 +666,7 @@ func runClient() {
 				// Display any remaining buffered data when connection is closed gracefully
 				message := messageBuffer.String()
 				if message != "" {
+					outputMutex.Lock()
 					fmt.Print("\r\033[K") // Clear current line
 					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 					messageBytes := []byte(message)
@@ -673,6 +683,7 @@ func runClient() {
 							timestamp, message, len(messageBytes), hexData)
 					}
 					fmt.Print("Send> ") // Re-display prompt
+					outputMutex.Unlock()
 					messageBuffer.Reset()
 				}
 				continue
@@ -685,6 +696,7 @@ func runClient() {
 					// Display message when terminator is found
 					message := messageBuffer.String()
 					if message != "" {
+						outputMutex.Lock()
 						fmt.Print("\r\033[K") // Clear current line
 						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 						messageBytes := []byte(message)
@@ -701,6 +713,7 @@ func runClient() {
 								timestamp, message, len(messageBytes), hexData)
 						}
 						fmt.Print("Send> ") // Re-display prompt
+						outputMutex.Unlock()
 					}
 					messageBuffer.Reset()
 				} else {
@@ -728,6 +741,7 @@ func runClient() {
 			break
 		}
 
+		outputMutex.Lock()
 		timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 		messageBytes := []byte(message)
 		hexData := fmt.Sprintf("%x", messageBytes)
@@ -742,8 +756,8 @@ func runClient() {
 			fmt.Printf("[Sent] %s | %s (Bytes: %d, HEX: %s)\n", 
 				timestamp, text, len(messageBytes), hexData)
 		}
-
 		fmt.Print("Send> ")
+		outputMutex.Unlock()
 	}
 
 	wg.Wait()
