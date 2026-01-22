@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -179,6 +181,25 @@ func runServer() {
 	// Manage connected clients
 	var clients sync.Map
 	var clientsMutex sync.RWMutex
+
+	// Handle Ctrl-C (SIGINT) signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nShutting down server...")
+		// Close all client connections
+		clientsMutex.Lock()
+		clients.Range(func(key, value interface{}) bool {
+			conn := value.(net.Conn)
+			conn.Close()
+			fmt.Printf("Disconnected client: %s\n", key)
+			return true
+		})
+		clientsMutex.Unlock()
+		listener.Close()
+		os.Exit(0)
+	}()
 
 	// Client connection handling
 	go func() {
@@ -556,6 +577,16 @@ func runClient() {
 	fmt.Printf("Buffer size: %d bytes\n", bufferSize)
 	fmt.Println("Chat started. Enter messages:")
 	fmt.Println("----------------------------------------")
+
+	// Handle Ctrl-C (SIGINT) signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nDisconnecting...")
+		conn.Close()
+		os.Exit(0)
+	}()
 
 	// Receive-only goroutine
 	var wg sync.WaitGroup
