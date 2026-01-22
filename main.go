@@ -684,14 +684,14 @@ func runClient() {
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
 					if colorEnabled {
-						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+						fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 							colorGreen, colorReset,
 							colorYellow, timestamp, colorReset,
 							message,
 							colorCyan, len(messageBytes), colorReset,
 							colorPurple, hexData, colorReset)
 					} else {
-						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
+						fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
 							timestamp, message, len(messageBytes), hexData)
 					}
 					fmt.Print("Send> ") // Re-display prompt
@@ -711,14 +711,14 @@ func runClient() {
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
 					if colorEnabled {
-						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+						fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 							colorGreen, colorReset,
 							colorYellow, timestamp, colorReset,
 							message,
 							colorCyan, len(messageBytes), colorReset,
 							colorPurple, hexData, colorReset)
 					} else {
-						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
+						fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
 							timestamp, message, len(messageBytes), hexData)
 					}
 					outputMutex.Unlock()
@@ -740,14 +740,14 @@ func runClient() {
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
 					if colorEnabled {
-						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+						fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 							colorGreen, colorReset,
 							colorYellow, timestamp, colorReset,
 							message,
 							colorCyan, len(messageBytes), colorReset,
 							colorPurple, hexData, colorReset)
 					} else {
-						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
+						fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
 							timestamp, message, len(messageBytes), hexData)
 					}
 					fmt.Print("Send> ") // Re-display prompt
@@ -770,14 +770,14 @@ func runClient() {
 						messageBytes := []byte(message)
 						hexData := fmt.Sprintf("%x", messageBytes)
 						if colorEnabled {
-							fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+							fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 								colorGreen, colorReset,
 								colorYellow, timestamp, colorReset,
 								message,
 								colorCyan, len(messageBytes), colorReset,
 								colorPurple, hexData, colorReset)
 						} else {
-							fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
+							fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
 								timestamp, message, len(messageBytes), hexData)
 						}
 						fmt.Print("Send> ") // Re-display prompt
@@ -815,14 +815,14 @@ func runClient() {
 		messageBytes := []byte(message)
 		hexData := fmt.Sprintf("%x", messageBytes)
 		if colorEnabled {
-			fmt.Printf("%s[Sent]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+			fmt.Printf("%s[Send]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 				colorCyan, colorReset,
 				colorYellow, timestamp, colorReset,
 				text,
 				colorCyan, len(messageBytes), colorReset,
 				colorPurple, hexData, colorReset)
 		} else {
-			fmt.Printf("[Sent] %s | %s (Bytes: %d, HEX: %s)\n",
+			fmt.Printf("[Send] %s | %s (Bytes: %d, HEX: %s)\n",
 				timestamp, text, len(messageBytes), hexData)
 		}
 		fmt.Print("Send> ")
