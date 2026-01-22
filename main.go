@@ -268,15 +268,80 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 	// Receive with specified buffer size
 	buffer := make([]byte, bufferSize)
 	var messageBuffer strings.Builder
+	const timeoutDuration = 100 * time.Millisecond // Timeout for incomplete messages
 
 	for {
+		// Set read deadline to detect when data stops coming
+		conn.SetReadDeadline(time.Now().Add(timeoutDuration))
 		n, err := conn.Read(buffer)
+		
+		// Check if it's a timeout error
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Timeout occurred - display buffered data if any
+			message := messageBuffer.String()
+			if message != "" {
+				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+				messageBytes := []byte(message)
+				hexData := fmt.Sprintf("%x", messageBytes)
+				if colorEnabled {
+					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+						colorBlue, conn.RemoteAddr().String(), colorReset,
+						colorYellow, timestamp, colorReset,
+						colorGreen, colorReset, message,
+						colorCyan, len(messageBytes), colorReset,
+						colorPurple, hexData, colorReset)
+				} else {
+					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n", 
+						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
+				}
+				messageBuffer.Reset()
+			}
+			continue // Continue reading
+		}
+		
 		if err != nil {
+			// Display any remaining buffered data before breaking
+			message := messageBuffer.String()
+			if message != "" {
+				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+				messageBytes := []byte(message)
+				hexData := fmt.Sprintf("%x", messageBytes)
+				if colorEnabled {
+					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+						colorBlue, conn.RemoteAddr().String(), colorReset,
+						colorYellow, timestamp, colorReset,
+						colorGreen, colorReset, message,
+						colorCyan, len(messageBytes), colorReset,
+						colorPurple, hexData, colorReset)
+				} else {
+					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n", 
+						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
+				}
+			}
 			fmt.Printf("[%s] Receive error: %v\n", conn.RemoteAddr().String(), err)
 			break
 		}
 
 		if n == 0 {
+			// Display any remaining buffered data when connection is closed gracefully
+			message := messageBuffer.String()
+			if message != "" {
+				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+				messageBytes := []byte(message)
+				hexData := fmt.Sprintf("%x", messageBytes)
+				if colorEnabled {
+					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+						colorBlue, conn.RemoteAddr().String(), colorReset,
+						colorYellow, timestamp, colorReset,
+						colorGreen, colorReset, message,
+						colorCyan, len(messageBytes), colorReset,
+						colorPurple, hexData, colorReset)
+				} else {
+					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n", 
+						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
+				}
+				messageBuffer.Reset()
+			}
 			continue
 		}
 
@@ -498,35 +563,110 @@ func runClient() {
 	go func() {
 		defer wg.Done()
 		buffer := make([]byte, bufferSize)
+		var messageBuffer strings.Builder
+		const timeoutDuration = 100 * time.Millisecond // Timeout for incomplete messages
 
 		for {
+			// Set read deadline to detect when data stops coming
+			conn.SetReadDeadline(time.Now().Add(timeoutDuration))
 			n, err := conn.Read(buffer)
+			
+			// Check if it's a timeout error
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Timeout occurred - display buffered data if any
+				message := messageBuffer.String()
+				if message != "" {
+					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+					messageBytes := []byte(message)
+					hexData := fmt.Sprintf("%x", messageBytes)
+					if colorEnabled {
+						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+							colorGreen, colorReset,
+							colorYellow, timestamp, colorReset,
+							message,
+							colorCyan, len(messageBytes), colorReset,
+							colorPurple, hexData, colorReset)
+					} else {
+						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+							timestamp, message, len(messageBytes), hexData)
+					}
+					messageBuffer.Reset()
+				}
+				continue // Continue reading
+			}
+			
 			if err != nil {
+				// Display any remaining buffered data before returning
+				message := messageBuffer.String()
+				if message != "" {
+					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+					messageBytes := []byte(message)
+					hexData := fmt.Sprintf("%x", messageBytes)
+					if colorEnabled {
+						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+							colorGreen, colorReset,
+							colorYellow, timestamp, colorReset,
+							message,
+							colorCyan, len(messageBytes), colorReset,
+							colorPurple, hexData, colorReset)
+					} else {
+						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+							timestamp, message, len(messageBytes), hexData)
+					}
+				}
 				fmt.Println("Receive error:", err)
 				return
 			}
 
 			if n == 0 {
+				// Display any remaining buffered data when connection is closed gracefully
+				message := messageBuffer.String()
+				if message != "" {
+					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+					messageBytes := []byte(message)
+					hexData := fmt.Sprintf("%x", messageBytes)
+					if colorEnabled {
+						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+							colorGreen, colorReset,
+							colorYellow, timestamp, colorReset,
+							message,
+							colorCyan, len(messageBytes), colorReset,
+							colorPurple, hexData, colorReset)
+					} else {
+						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+							timestamp, message, len(messageBytes), hexData)
+					}
+					messageBuffer.Reset()
+				}
 				continue
 			}
 
-			// Process received data - display as-is without waiting for terminator
-			// Response messages don't use the terminator character
+			// Process received data - wait for terminator like server side
 			data := buffer[:n]
-			message := string(data)
-			timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-			messageBytes := []byte(message)
-			hexData := fmt.Sprintf("%x", messageBytes)
-			if colorEnabled {
-				fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
-					colorGreen, colorReset,
-					colorYellow, timestamp, colorReset,
-					message,
-					colorCyan, len(messageBytes), colorReset,
-					colorPurple, hexData, colorReset)
-			} else {
-				fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
-					timestamp, message, len(messageBytes), hexData)
+			for _, b := range data {
+				if b == terminatorBytes[0] {
+					// Display message when terminator is found
+					message := messageBuffer.String()
+					if message != "" {
+						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+						messageBytes := []byte(message)
+						hexData := fmt.Sprintf("%x", messageBytes)
+						if colorEnabled {
+							fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+								colorGreen, colorReset,
+								colorYellow, timestamp, colorReset,
+								message,
+								colorCyan, len(messageBytes), colorReset,
+								colorPurple, hexData, colorReset)
+						} else {
+							fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+								timestamp, message, len(messageBytes), hexData)
+						}
+					}
+					messageBuffer.Reset()
+				} else {
+					messageBuffer.WriteByte(b)
+				}
 			}
 		}
 	}()
