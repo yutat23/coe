@@ -770,32 +770,32 @@ func runClient() {
 			// Process received data - wait for terminator like server side
 			data := buffer[:n]
 			for _, b := range data {
+				messageBuffer.WriteByte(b)
 				if b == terminatorBytes[0] {
 					// Display message when terminator is found
-					message := messageBuffer.String()
-					if message != "" {
+					messageBytes := []byte(messageBuffer.String())
+					if len(messageBytes) > 0 {
 						outputMutex.Lock()
 						fmt.Print("\r\033[K") // Clear current line
 						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-						messageBytes := []byte(message)
+						// Display message without terminator for readability
+						displayMessage := strings.TrimSuffix(string(messageBytes), string(terminatorBytes))
 						hexData := fmt.Sprintf("%x", messageBytes)
 						if colorEnabled {
 							fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 								colorGreen, colorReset,
 								colorYellow, timestamp, colorReset,
-								message,
+								displayMessage,
 								colorCyan, len(messageBytes), colorReset,
 								colorPurple, hexData, colorReset)
 						} else {
 							fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
-								timestamp, message, len(messageBytes), hexData)
+								timestamp, displayMessage, len(messageBytes), hexData)
 						}
 						fmt.Print("Send> ") // Re-display prompt
 						outputMutex.Unlock()
 					}
 					messageBuffer.Reset()
-				} else {
-					messageBuffer.WriteByte(b)
 				}
 			}
 		}
