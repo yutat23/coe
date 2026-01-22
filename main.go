@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 // Color codes
 const (
