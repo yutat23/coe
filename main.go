@@ -90,6 +90,13 @@ func usage() {
 	fmt.Println("  Cyan    - Byte counts")
 	fmt.Println("  Purple  - Hexadecimal data")
 	fmt.Println("")
+	fmt.Println("ESCAPE SEQUENCES (in messages)")
+	fmt.Println("  \\r     - CR (0x0D)")
+	fmt.Println("  \\n     - LF (0x0A)")
+	fmt.Println("  \\t     - TAB (0x09)")
+	fmt.Println("  \\\\     - Backslash (0x5C)")
+	fmt.Println("  \\xHH   - Arbitrary byte in hex (e.g., \\x1B for ESC)")
+	fmt.Println("")
 	fmt.Println("EXAMPLES")
 	fmt.Println("  coe -s 8080")
 	fmt.Println("  coe -s 8080 CR")
@@ -427,8 +434,11 @@ func sendToClient(clients *sync.Map, clientsMutex *sync.RWMutex, clientIP string
 	clientsMutex.RLock()
 	defer clientsMutex.RUnlock()
 
+	// Process escape sequences in message
+	processedMessage := processEscapeSequences(message)
+
 	if conn, ok := clients.Load(clientIP); ok {
-		response := message + string(terminatorBytes)
+		response := processedMessage + string(terminatorBytes)
 		_, err := conn.(net.Conn).Write([]byte(response))
 		if err != nil {
 			fmt.Printf("Send error [%s]: %v\n", clientIP, err)
@@ -436,6 +446,7 @@ func sendToClient(clients *sync.Map, clientsMutex *sync.RWMutex, clientIP string
 			timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 			responseBytes := []byte(response)
 			hexData := fmt.Sprintf("%x", responseBytes)
+			// Display original message (with escape sequences) for readability
 			if colorEnabled {
 				fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
 					colorBlue, clientIP, colorReset,
@@ -457,9 +468,12 @@ func broadcastToAll(clients *sync.Map, clientsMutex *sync.RWMutex, message strin
 	clientsMutex.RLock()
 	defer clientsMutex.RUnlock()
 
+	// Process escape sequences in message
+	processedMessage := processEscapeSequences(message)
+
 	count := 0
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-	response := message + string(terminatorBytes)
+	response := processedMessage + string(terminatorBytes)
 	responseBytes := []byte(response)
 	hexData := fmt.Sprintf("%x", responseBytes)
 	
@@ -513,7 +527,61 @@ func printServerHelp() {
 	fmt.Println("  #help: Show this help message")
 	fmt.Println("  #quit, #exit: Shut down the server")
 	fmt.Println("")
+	fmt.Println("Escape sequences in messages:")
+	fmt.Println("  \\r  → CR (0x0D)")
+	fmt.Println("  \\n  → LF (0x0A)")
+	fmt.Println("  \\t  → TAB (0x09)")
+	fmt.Println("  \\\\  → Backslash (0x5C)")
+	fmt.Println("  \\xHH → Arbitrary byte (e.g., \\x1B for ESC)")
+	fmt.Println("")
 	fmt.Println("Program help: Type 'help program' for full program usage")
+}
+
+// processEscapeSequences converts escape sequences in a string to their byte values
+func processEscapeSequences(input string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(input) {
+		if input[i] == '\\' && i+1 < len(input) {
+			switch input[i+1] {
+			case 'r':
+				result.WriteByte(0x0D) // CR
+				i += 2
+			case 'n':
+				result.WriteByte(0x0A) // LF
+				i += 2
+			case 't':
+				result.WriteByte(0x09) // TAB
+				i += 2
+			case '\\':
+				result.WriteByte(0x5C) // Backslash
+				i += 2
+			case 'x':
+				// Handle \xHH format
+				if i+3 < len(input) {
+					hexStr := input[i+2 : i+4]
+					var byteVal byte
+					_, err := fmt.Sscanf(hexStr, "%02x", &byteVal)
+					if err == nil {
+						result.WriteByte(byteVal)
+						i += 4
+						continue
+					}
+				}
+				// Invalid \x sequence, keep as-is
+				result.WriteByte(input[i])
+				i++
+			default:
+				// Unknown escape sequence, keep as-is
+				result.WriteByte(input[i])
+				i++
+			}
+		} else {
+			result.WriteByte(input[i])
+			i++
+		}
+	}
+	return result.String()
 }
 
 func runClient() {
@@ -733,8 +801,9 @@ func runClient() {
 			continue
 		}
 
-		// Send with specified terminator
-		message := text + string(terminatorBytes)
+		// Process escape sequences and send with specified terminator
+		processedText := processEscapeSequences(text)
+		message := processedText + string(terminatorBytes)
 		_, err := conn.Write([]byte(message))
 		if err != nil {
 			fmt.Println("Send error:", err)

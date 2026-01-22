@@ -145,6 +145,12 @@ When `--color` is enabled, the output uses the following color scheme:
 - **Cyan**: Byte counts
 - **Purple**: Hexadecimal data
 
+## Escape Sequences
+
+Messages support escape sequences: `\r` (CR), `\n` (LF), `\t` (TAB), `\\` (backslash), `\xHH` (hex byte).
+
+Example: `Hello\r\nWorld` sends "Hello" + CR + LF + "World"
+
 ## How It Works
 
 ### Server Mode
