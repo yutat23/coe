@@ -30,7 +30,7 @@ var colorEnabled bool
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
+		shortUsage()
 		return
 	}
 
@@ -42,10 +42,10 @@ func main() {
 	case "-c", "--client":
 		runClient()
 	case "-h", "--help", "help":
-		usage()
+		fullUsage()
 	default:
 		fmt.Println("Error: Mode must be '-s'/'--server' or '-c'/'--client'")
-		usage()
+		shortUsage()
 	}
 }
 
@@ -68,7 +68,17 @@ func showLogo() error {
 	return nil
 }
 
-func usage() {
+func shortUsage() {
+	showLogo()
+	fmt.Println("")
+	fmt.Println("USAGE")
+	fmt.Println("  Server mode:  coe -s <port> [options]")
+	fmt.Println("  Client mode:  coe -c <IP> <port> <terminator> [options]")
+	fmt.Println("")
+	fmt.Println("Use 'coe --help' for detailed options and examples.")
+}
+
+func fullUsage() {
 	showLogo()
 	fmt.Println("")
 	fmt.Println("USAGE")
@@ -273,7 +283,7 @@ func runServer() {
 			liscoeents(&clients, &clientsMutex)
 		case "#help":
 			if len(parts) > 1 && parts[1] == "program" {
-				usage()
+				fullUsage()
 			} else {
 				printServerHelp()
 			}
