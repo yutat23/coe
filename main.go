@@ -50,22 +50,22 @@ func main() {
 }
 
 func showLogo() error {
-		logoLines := []string{
-			" ██████╗ ██████╗ ███████╗",
-			"██╔════╝██╔═══██╗██╔════╝",
-			"██║     ██║   ██║█████╗",
-			"██║     ██║   ██║██╔══╝",
-			"╚██████╗╚██████╔╝███████╗",
-			" ╚═════╝ ╚═════╝ ╚══════╝",
-			"",
-			" coe - Communicate and echo through sockets.",
-			" Version " + version,
-		}
+	logoLines := []string{
+		" ██████╗ ██████╗ ███████╗",
+		"██╔════╝██╔═══██╗██╔════╝",
+		"██║     ██║   ██║█████╗",
+		"██║     ██║   ██║██╔══╝",
+		"╚██████╗╚██████╔╝███████╗",
+		" ╚═════╝ ╚═════╝ ╚══════╝",
+		"",
+		" coe - Communicate and echo through sockets.",
+		" Version " + version,
+	}
 	for _, line := range logoLines {
 		fmt.Println(line)
 	}
-	
-		return nil
+
+	return nil
 }
 
 func usage() {
@@ -116,11 +116,11 @@ func runServer() {
 	}
 
 	port := os.Args[2]
-	terminator := "LF" // Default
+	terminator := "LF"  // Default
 	echoEnabled := true // Default echo enabled
-	bufferSize := 1024 // Default buffer size
+	bufferSize := 1024  // Default buffer size
 	colorEnabled = true // Default color enabled
-	
+
 	// Parse arguments
 	for i := 3; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -219,16 +219,16 @@ func runServer() {
 
 			clientAddr := conn.RemoteAddr().String()
 			fmt.Printf("Client connected: %s\n", clientAddr)
-			
+
 			// Add to client list
 			clientsMutex.Lock()
 			clients.Store(clientAddr, conn)
 			clientsMutex.Unlock()
-			
+
 			// Handle each client in separate goroutine
 			go func() {
 				handleClient(conn, terminatorBytes, echoEnabled, &clients, &clientsMutex, bufferSize)
-				
+
 				// Remove from client list when disconnected
 				clientsMutex.Lock()
 				clients.Delete(clientAddr)
@@ -302,7 +302,7 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 		// Set read deadline to detect when data stops coming
 		conn.SetReadDeadline(time.Now().Add(timeoutDuration))
 		n, err := conn.Read(buffer)
-		
+
 		// Check if it's a timeout error
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			// Timeout occurred - display buffered data if any
@@ -312,21 +312,21 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 				messageBytes := []byte(message)
 				hexData := fmt.Sprintf("%x", messageBytes)
 				if colorEnabled {
-					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 						colorBlue, conn.RemoteAddr().String(), colorReset,
 						colorYellow, timestamp, colorReset,
 						colorGreen, colorReset, message,
 						colorCyan, len(messageBytes), colorReset,
 						colorPurple, hexData, colorReset)
 				} else {
-					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n", 
+					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
 						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
 				}
 				messageBuffer.Reset()
 			}
 			continue // Continue reading
 		}
-		
+
 		if err != nil {
 			// Display any remaining buffered data before breaking
 			message := messageBuffer.String()
@@ -335,14 +335,14 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 				messageBytes := []byte(message)
 				hexData := fmt.Sprintf("%x", messageBytes)
 				if colorEnabled {
-					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 						colorBlue, conn.RemoteAddr().String(), colorReset,
 						colorYellow, timestamp, colorReset,
 						colorGreen, colorReset, message,
 						colorCyan, len(messageBytes), colorReset,
 						colorPurple, hexData, colorReset)
 				} else {
-					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n", 
+					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
 						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
 				}
 			}
@@ -358,14 +358,14 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 				messageBytes := []byte(message)
 				hexData := fmt.Sprintf("%x", messageBytes)
 				if colorEnabled {
-					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 						colorBlue, conn.RemoteAddr().String(), colorReset,
 						colorYellow, timestamp, colorReset,
 						colorGreen, colorReset, message,
 						colorCyan, len(messageBytes), colorReset,
 						colorPurple, hexData, colorReset)
 				} else {
-					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n", 
+					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
 						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
 				}
 				messageBuffer.Reset()
@@ -387,17 +387,17 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
 					if colorEnabled {
-						fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+						fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 							colorBlue, conn.RemoteAddr().String(), colorReset,
 							colorYellow, timestamp, colorReset,
 							colorGreen, colorReset, message,
 							colorCyan, len(messageBytes), colorReset,
 							colorPurple, hexData, colorReset)
 					} else {
-						fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n", 
+						fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
 							conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
 					}
-					
+
 					// Echo back functionality (optional)
 					if echoEnabled {
 						response := message + string(terminatorBytes)
@@ -410,14 +410,14 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 						responseBytes := []byte(response)
 						hexData := fmt.Sprintf("%x", responseBytes)
 						if colorEnabled {
-							fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+							fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 								colorBlue, conn.RemoteAddr().String(), colorReset,
 								colorYellow, timestamp, colorReset,
 								colorRed, colorReset, message,
 								colorCyan, len(responseBytes), colorReset,
 								colorPurple, hexData, colorReset)
 						} else {
-							fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n", 
+							fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n",
 								conn.RemoteAddr().String(), timestamp, message, len(responseBytes), hexData)
 						}
 					}
@@ -448,14 +448,14 @@ func sendToClient(clients *sync.Map, clientsMutex *sync.RWMutex, clientIP string
 			hexData := fmt.Sprintf("%x", responseBytes)
 			// Display original message (with escape sequences) for readability
 			if colorEnabled {
-				fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+				fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 					colorBlue, clientIP, colorReset,
 					colorYellow, timestamp, colorReset,
 					colorRed, colorReset, message,
 					colorCyan, len(responseBytes), colorReset,
 					colorPurple, hexData, colorReset)
 			} else {
-				fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n", 
+				fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n",
 					clientIP, timestamp, message, len(responseBytes), hexData)
 			}
 		}
@@ -476,7 +476,7 @@ func broadcastToAll(clients *sync.Map, clientsMutex *sync.RWMutex, message strin
 	response := processedMessage + string(terminatorBytes)
 	responseBytes := []byte(response)
 	hexData := fmt.Sprintf("%x", responseBytes)
-	
+
 	clients.Range(func(key, value interface{}) bool {
 		conn := value.(net.Conn)
 		_, err := conn.Write([]byte(response))
@@ -484,14 +484,14 @@ func broadcastToAll(clients *sync.Map, clientsMutex *sync.RWMutex, message strin
 			fmt.Printf("Send error [%s]: %v\n", key, err)
 		} else {
 			if colorEnabled {
-				fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+				fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 					colorBlue, key, colorReset,
 					colorYellow, timestamp, colorReset,
 					colorRed, colorReset, message,
 					colorCyan, len(responseBytes), colorReset,
 					colorPurple, hexData, colorReset)
 			} else {
-				fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n", 
+				fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n",
 					key, timestamp, message, len(responseBytes), hexData)
 			}
 			count++
@@ -593,9 +593,9 @@ func runClient() {
 
 	address := os.Args[2] + ":" + os.Args[3]
 	terminator := os.Args[4]
-	bufferSize := 1024 // Default buffer size
+	bufferSize := 1024  // Default buffer size
 	colorEnabled = true // Default color enabled
-	
+
 	// Parse arguments
 	for i := 5; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -620,7 +620,7 @@ func runClient() {
 			colorEnabled = false
 		}
 	}
-	
+
 	// Set terminator
 	var terminatorBytes []byte
 	switch strings.ToUpper(terminator) {
@@ -672,7 +672,7 @@ func runClient() {
 			// Set read deadline to detect when data stops coming
 			conn.SetReadDeadline(time.Now().Add(timeoutDuration))
 			n, err := conn.Read(buffer)
-			
+
 			// Check if it's a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Timeout occurred - display buffered data if any
@@ -684,14 +684,14 @@ func runClient() {
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
 					if colorEnabled {
-						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 							colorGreen, colorReset,
 							colorYellow, timestamp, colorReset,
 							message,
 							colorCyan, len(messageBytes), colorReset,
 							colorPurple, hexData, colorReset)
 					} else {
-						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
 							timestamp, message, len(messageBytes), hexData)
 					}
 					fmt.Print("Send> ") // Re-display prompt
@@ -700,7 +700,7 @@ func runClient() {
 				}
 				continue // Continue reading
 			}
-			
+
 			if err != nil {
 				// Display any remaining buffered data before returning
 				message := messageBuffer.String()
@@ -711,14 +711,14 @@ func runClient() {
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
 					if colorEnabled {
-						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 							colorGreen, colorReset,
 							colorYellow, timestamp, colorReset,
 							message,
 							colorCyan, len(messageBytes), colorReset,
 							colorPurple, hexData, colorReset)
 					} else {
-						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
 							timestamp, message, len(messageBytes), hexData)
 					}
 					outputMutex.Unlock()
@@ -740,14 +740,14 @@ func runClient() {
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
 					if colorEnabled {
-						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+						fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 							colorGreen, colorReset,
 							colorYellow, timestamp, colorReset,
 							message,
 							colorCyan, len(messageBytes), colorReset,
 							colorPurple, hexData, colorReset)
 					} else {
-						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
 							timestamp, message, len(messageBytes), hexData)
 					}
 					fmt.Print("Send> ") // Re-display prompt
@@ -770,14 +770,14 @@ func runClient() {
 						messageBytes := []byte(message)
 						hexData := fmt.Sprintf("%x", messageBytes)
 						if colorEnabled {
-							fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+							fmt.Printf("%s[Received]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 								colorGreen, colorReset,
 								colorYellow, timestamp, colorReset,
 								message,
 								colorCyan, len(messageBytes), colorReset,
 								colorPurple, hexData, colorReset)
 						} else {
-							fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
+							fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n",
 								timestamp, message, len(messageBytes), hexData)
 						}
 						fmt.Print("Send> ") // Re-display prompt
@@ -815,14 +815,14 @@ func runClient() {
 		messageBytes := []byte(message)
 		hexData := fmt.Sprintf("%x", messageBytes)
 		if colorEnabled {
-			fmt.Printf("%s[Sent]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n", 
+			fmt.Printf("%s[Sent]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 				colorCyan, colorReset,
 				colorYellow, timestamp, colorReset,
 				text,
 				colorCyan, len(messageBytes), colorReset,
 				colorPurple, hexData, colorReset)
 		} else {
-			fmt.Printf("[Sent] %s | %s (Bytes: %d, HEX: %s)\n", 
+			fmt.Printf("[Sent] %s | %s (Bytes: %d, HEX: %s)\n",
 				timestamp, text, len(messageBytes), hexData)
 		}
 		fmt.Print("Send> ")
