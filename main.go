@@ -576,6 +576,7 @@ func runClient() {
 				// Timeout occurred - display buffered data if any
 				message := messageBuffer.String()
 				if message != "" {
+					fmt.Print("\r\033[K") // Clear current line
 					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
@@ -590,6 +591,7 @@ func runClient() {
 						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
 							timestamp, message, len(messageBytes), hexData)
 					}
+					fmt.Print("Send> ") // Re-display prompt
 					messageBuffer.Reset()
 				}
 				continue // Continue reading
@@ -599,6 +601,7 @@ func runClient() {
 				// Display any remaining buffered data before returning
 				message := messageBuffer.String()
 				if message != "" {
+					fmt.Print("\r\033[K") // Clear current line
 					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
@@ -614,6 +617,7 @@ func runClient() {
 							timestamp, message, len(messageBytes), hexData)
 					}
 				}
+				fmt.Print("\r\033[K") // Clear current line before error message
 				fmt.Println("Receive error:", err)
 				return
 			}
@@ -622,6 +626,7 @@ func runClient() {
 				// Display any remaining buffered data when connection is closed gracefully
 				message := messageBuffer.String()
 				if message != "" {
+					fmt.Print("\r\033[K") // Clear current line
 					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 					messageBytes := []byte(message)
 					hexData := fmt.Sprintf("%x", messageBytes)
@@ -636,6 +641,7 @@ func runClient() {
 						fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
 							timestamp, message, len(messageBytes), hexData)
 					}
+					fmt.Print("Send> ") // Re-display prompt
 					messageBuffer.Reset()
 				}
 				continue
@@ -648,6 +654,7 @@ func runClient() {
 					// Display message when terminator is found
 					message := messageBuffer.String()
 					if message != "" {
+						fmt.Print("\r\033[K") // Clear current line
 						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 						messageBytes := []byte(message)
 						hexData := fmt.Sprintf("%x", messageBytes)
@@ -662,6 +669,7 @@ func runClient() {
 							fmt.Printf("[Received] %s | %s (Bytes: %d, HEX: %s)\n", 
 								timestamp, message, len(messageBytes), hexData)
 						}
+						fmt.Print("Send> ") // Re-display prompt
 					}
 					messageBuffer.Reset()
 				} else {
