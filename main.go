@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"net"
 	"os"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "0.1.3"
+const version = "0.1.4"
 
 // Color codes
 const (
@@ -27,6 +28,72 @@ const (
 )
 
 var colorEnabled bool
+
+func parseTerminator(name string) ([]byte, error) {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "LF":
+		return []byte{0x0A}, nil
+	case "CR":
+		return []byte{0x0D}, nil
+	case "CRLF":
+		return []byte{0x0D, 0x0A}, nil
+	default:
+		return nil, fmt.Errorf("terminator must be LF, CR, or CRLF")
+	}
+}
+
+func terminatorToken(arg string) bool {
+	switch strings.ToUpper(strings.TrimSpace(arg)) {
+	case "LF", "CR", "CRLF":
+		return true
+	default:
+		return false
+	}
+}
+
+func terminatorHexDescription(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	parts := make([]string, len(b))
+	for i, x := range b {
+		parts[i] = fmt.Sprintf("0x%02X", x)
+	}
+	return strings.Join(parts, " ")
+}
+
+// appendAndFlushBySuffix frames messages by recvTerm. When recvTerm is CR only, an LF immediately
+// after a completed frame is dropped so peer CRLF does not appear as a second (empty) message.
+func appendAndFlushBySuffix(messageBuffer *bytes.Buffer, data []byte, recvTerm []byte, pendingSkipLF *bool, onMessage func(msg string)) {
+	swallowLFAfterCR := len(recvTerm) == 1 && recvTerm[0] == 0x0D
+	for _, b := range data {
+		if *pendingSkipLF {
+			*pendingSkipLF = false
+			if b == 0x0A {
+				continue
+			}
+		}
+		messageBuffer.WriteByte(b)
+		bs := messageBuffer.Bytes()
+		if len(bs) >= len(recvTerm) && bytes.Equal(bs[len(bs)-len(recvTerm):], recvTerm) {
+			msg := string(bs[:len(bs)-len(recvTerm)])
+			onMessage(msg)
+			messageBuffer.Reset()
+			if swallowLFAfterCR {
+				*pendingSkipLF = true
+			}
+		}
+	}
+}
+
+func discardOrphanLFAfterCR(messageBuffer *bytes.Buffer, recvTerm []byte) bool {
+	if len(recvTerm) == 1 && recvTerm[0] == 0x0D &&
+		messageBuffer.Len() == 1 && messageBuffer.Bytes()[0] == 0x0A {
+		messageBuffer.Reset()
+		return true
+	}
+	return false
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -72,7 +139,7 @@ func shortUsage() {
 	showLogo()
 	fmt.Println("")
 	fmt.Println("USAGE")
-	fmt.Println("  Server mode:  coe -s <port> [options]")
+	fmt.Println("  Server mode:  coe -s <port> [terminator] [options]")
 	fmt.Println("  Client mode:  coe -c <IP> <port> <terminator> [options]")
 	fmt.Println("")
 	fmt.Println("Use 'coe --help' for detailed options and examples.")
@@ -82,11 +149,15 @@ func fullUsage() {
 	showLogo()
 	fmt.Println("")
 	fmt.Println("USAGE")
-	fmt.Println("  Server mode:   coe -s, --server <port> [terminator] [--no-echo] [--buffer-size <size>] [--color] [--no-color]")
-	fmt.Println("  Client mode    coe -c, --client <IP> <port> <terminator> [--buffer-size <size>] [--color] [--no-color]")
+	fmt.Println("  Server mode:   coe -s, --server <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
+	fmt.Println("                 [--no-echo] [--buffer-size <size>] [--color] [--no-color]")
+	fmt.Println("  Client mode:   coe -c, --client <IP> <port> <terminator> [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
+	fmt.Println("                 [--buffer-size <size>] [--color] [--no-color]")
 	fmt.Println("")
 	fmt.Println("OPTIONS")
-	fmt.Println("Terminator: LF (0A) or CR (0D) - Default is LF")
+	fmt.Println("Terminator: LF, CR, or CRLF (CR+LF). Positional <terminator> sets both send and receive unless overridden.")
+	fmt.Println("-tt T, --tx-term T   Outgoing delimiter (#send/#broadcast, echo, client send); --send-terminator is an alias")
+	fmt.Println("-rt T, --rx-term T   Frame incoming data until this sequence; --recv-terminator is an alias")
 	fmt.Println("--no-echo        Disable echo back (Server mode only)")
 	fmt.Println("--buffer-size    Specify buffer size (bytes) - Default is 1024")
 	fmt.Println("--color          Enable colored output for better readability (Default: enabled)")
@@ -115,18 +186,20 @@ func fullUsage() {
 	fmt.Println("  coe -s 8080 --color")
 	fmt.Println("  coe -s 8080 --no-color")
 	fmt.Println("  coe -c 127.0.0.1 8080 LF")
+	fmt.Println("  coe -c 127.0.0.1 8080 CR -rt CRLF")
 	fmt.Println("  coe --client 192.168.1.100 8080 CR --buffer-size 512 --color")
 	fmt.Println("  coe --client 192.168.1.100 8080 CR --no-color")
 }
 
 func runServer() {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: -s, --server <port> [terminator] [--no-echo] [--buffer-size <size>] [--color] [--no-color]")
+		fmt.Println("Usage: -s, --server <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T] [--no-echo] [--buffer-size <size>] [--color] [--no-color]")
 		return
 	}
 
 	port := os.Args[2]
-	terminator := "LF"  // Default
+	var legacyTerminator string
+	var sendTerminatorName, recvTerminatorName string
 	echoEnabled := true // Default echo enabled
 	bufferSize := 1024  // Default buffer size
 	colorEnabled = true // Default color enabled
@@ -151,24 +224,52 @@ func runServer() {
 				fmt.Println("Error: Buffer size must be specified after --buffer-size")
 				return
 			}
+		} else if arg == "-tt" || arg == "--tx-term" || arg == "--send-terminator" {
+			if i+1 >= len(os.Args) {
+				fmt.Println("Error: Value required after -tt / --tx-term (LF, CR, or CRLF)")
+				return
+			}
+			sendTerminatorName = os.Args[i+1]
+			i++
+		} else if arg == "-rt" || arg == "--rx-term" || arg == "--recv-terminator" {
+			if i+1 >= len(os.Args) {
+				fmt.Println("Error: Value required after -rt / --rx-term (LF, CR, or CRLF)")
+				return
+			}
+			recvTerminatorName = os.Args[i+1]
+			i++
 		} else if arg == "--color" {
 			colorEnabled = true
 		} else if arg == "--no-color" {
 			colorEnabled = false
-		} else if terminator == "LF" && (arg == "LF" || arg == "CR") {
-			terminator = arg
+		} else if legacyTerminator == "" && terminatorToken(arg) {
+			legacyTerminator = arg
 		}
 	}
 
-	// Set terminator
-	var terminatorBytes []byte
-	switch strings.ToUpper(terminator) {
-	case "LF":
-		terminatorBytes = []byte{0x0A} // LF
-	case "CR":
-		terminatorBytes = []byte{0x0D} // CR
-	default:
-		fmt.Println("Error: Terminator must be 'LF' or 'CR'")
+	if legacyTerminator != "" {
+		if sendTerminatorName == "" {
+			sendTerminatorName = legacyTerminator
+		}
+		if recvTerminatorName == "" {
+			recvTerminatorName = legacyTerminator
+		}
+	}
+	if sendTerminatorName == "" {
+		sendTerminatorName = "LF"
+	}
+	if recvTerminatorName == "" {
+		recvTerminatorName = "LF"
+	}
+
+	sendTerminatorBytes, err := parseTerminator(sendTerminatorName)
+	if err != nil {
+		fmt.Println("Error (-tt / --tx-term):", err)
+		return
+	}
+	recvTerminatorBytes, err := parseTerminator(recvTerminatorName)
+	if err != nil {
+		fmt.Println("Error (-rt / --rx-term):", err)
 		return
 	}
 
@@ -180,7 +281,8 @@ func runServer() {
 	defer listener.Close()
 
 	fmt.Printf("Server started on port: %s\n", port)
-	fmt.Printf("Terminator: %s (0x%02X)\n", terminator, terminatorBytes[0])
+	fmt.Printf("Send terminator:    %s (%s)\n", strings.ToUpper(sendTerminatorName), terminatorHexDescription(sendTerminatorBytes))
+	fmt.Printf("Receive terminator: %s (%s)\n", strings.ToUpper(recvTerminatorName), terminatorHexDescription(recvTerminatorBytes))
 	fmt.Printf("Buffer size: %d bytes\n", bufferSize)
 	if echoEnabled {
 		fmt.Println("Echo back: Enabled")
@@ -237,7 +339,7 @@ func runServer() {
 
 			// Handle each client in separate goroutine
 			go func() {
-				handleClient(conn, terminatorBytes, echoEnabled, &clients, &clientsMutex, bufferSize)
+				handleClient(conn, recvTerminatorBytes, sendTerminatorBytes, echoEnabled, &clients, &clientsMutex, bufferSize)
 
 				// Remove from client list when disconnected
 				clientsMutex.Lock()
@@ -270,14 +372,14 @@ func runServer() {
 			} else {
 				clientIP := parts[1]
 				message := strings.Join(parts[2:], " ")
-				sendToClient(&clients, &clientsMutex, clientIP, message, terminatorBytes)
+				sendToClient(&clients, &clientsMutex, clientIP, message, sendTerminatorBytes)
 			}
 		case "#broadcast":
 			if len(parts) < 2 {
 				fmt.Println("Usage: broadcast <message>")
 			} else {
 				message := strings.Join(parts[1:], " ")
-				broadcastToAll(&clients, &clientsMutex, message, terminatorBytes)
+				broadcastToAll(&clients, &clientsMutex, message, sendTerminatorBytes)
 			}
 		case "#list":
 			liscoeents(&clients, &clientsMutex)
@@ -299,13 +401,14 @@ func runServer() {
 	}
 }
 
-func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clients *sync.Map, clientsMutex *sync.RWMutex, bufferSize int) {
+func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte, echoEnabled bool, clients *sync.Map, clientsMutex *sync.RWMutex, bufferSize int) {
 	defer conn.Close()
 	defer fmt.Printf("Client disconnected: %s\n", conn.RemoteAddr().String())
 
 	// Receive with specified buffer size
 	buffer := make([]byte, bufferSize)
-	var messageBuffer strings.Builder
+	var messageBuffer bytes.Buffer
+	var pendingSkipLF bool
 	const timeoutDuration = 100 * time.Millisecond // Timeout for incomplete messages
 
 	for {
@@ -316,6 +419,9 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 		// Check if it's a timeout error
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			// Timeout occurred - display buffered data if any
+			if discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
+				continue
+			}
 			message := messageBuffer.String()
 			if message != "" {
 				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
@@ -339,21 +445,23 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 
 		if err != nil {
 			// Display any remaining buffered data before breaking
-			message := messageBuffer.String()
-			if message != "" {
-				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-				messageBytes := []byte(message)
-				hexData := fmt.Sprintf("%x", messageBytes)
-				if colorEnabled {
-					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-						colorBlue, conn.RemoteAddr().String(), colorReset,
-						colorYellow, timestamp, colorReset,
-						colorGreen, colorReset, message,
-						colorCyan, len(messageBytes), colorReset,
-						colorPurple, hexData, colorReset)
-				} else {
-					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
-						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
+			if !discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
+				message := messageBuffer.String()
+				if message != "" {
+					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+					messageBytes := []byte(message)
+					hexData := fmt.Sprintf("%x", messageBytes)
+					if colorEnabled {
+						fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+							colorBlue, conn.RemoteAddr().String(), colorReset,
+							colorYellow, timestamp, colorReset,
+							colorGreen, colorReset, message,
+							colorCyan, len(messageBytes), colorReset,
+							colorPurple, hexData, colorReset)
+					} else {
+						fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
+							conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
+					}
 				}
 			}
 			fmt.Printf("[%s] Receive error: %v\n", conn.RemoteAddr().String(), err)
@@ -362,6 +470,9 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 
 		if n == 0 {
 			// Display any remaining buffered data when connection is closed gracefully
+			if discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
+				continue
+			}
 			message := messageBuffer.String()
 			if message != "" {
 				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
@@ -386,56 +497,54 @@ func handleClient(conn net.Conn, terminatorBytes []byte, echoEnabled bool, clien
 		// Debug: Show received data details
 		// fmt.Printf("[%s] Debug: Received bytes=%d, data=%x\n", conn.RemoteAddr().String(), n, buffer[:n])
 
-		// Process received data
+		// Process received data (frame by recv terminator suffix)
 		data := buffer[:n]
-		for _, b := range data {
-			if b == terminatorBytes[0] {
-				// Display message when terminator is found
-				message := messageBuffer.String()
-				if message != "" {
-					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-					messageBytes := []byte(message)
-					hexData := fmt.Sprintf("%x", messageBytes)
-					if colorEnabled {
-						fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-							colorBlue, conn.RemoteAddr().String(), colorReset,
-							colorYellow, timestamp, colorReset,
-							colorGreen, colorReset, message,
-							colorCyan, len(messageBytes), colorReset,
-							colorPurple, hexData, colorReset)
-					} else {
-						fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
-							conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
-					}
-
-					// Echo back functionality (optional)
-					if echoEnabled {
-						response := message + string(terminatorBytes)
-						_, err := conn.Write([]byte(response))
-						if err != nil {
-							fmt.Printf("[%s] Send error: %v\n", conn.RemoteAddr().String(), err)
-							return
-						}
-						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-						responseBytes := []byte(response)
-						hexData := fmt.Sprintf("%x", responseBytes)
-						if colorEnabled {
-							fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-								colorBlue, conn.RemoteAddr().String(), colorReset,
-								colorYellow, timestamp, colorReset,
-								colorRed, colorReset, message,
-								colorCyan, len(responseBytes), colorReset,
-								colorPurple, hexData, colorReset)
-						} else {
-							fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n",
-								conn.RemoteAddr().String(), timestamp, message, len(responseBytes), hexData)
-						}
-					}
-				}
-				messageBuffer.Reset()
-			} else {
-				messageBuffer.WriteByte(b)
+		stopClient := false
+		appendAndFlushBySuffix(&messageBuffer, data, recvTerminatorBytes, &pendingSkipLF, func(message string) {
+			if message == "" {
+				return
 			}
+			timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+			messageBytes := []byte(message)
+			hexData := fmt.Sprintf("%x", messageBytes)
+			if colorEnabled {
+				fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+					colorBlue, conn.RemoteAddr().String(), colorReset,
+					colorYellow, timestamp, colorReset,
+					colorGreen, colorReset, message,
+					colorCyan, len(messageBytes), colorReset,
+					colorPurple, hexData, colorReset)
+			} else {
+				fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
+					conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
+			}
+
+			if echoEnabled {
+				response := message + string(sendTerminatorBytes)
+				_, err := conn.Write([]byte(response))
+				if err != nil {
+					fmt.Printf("[%s] Send error: %v\n", conn.RemoteAddr().String(), err)
+					stopClient = true
+					return
+				}
+				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+				responseBytes := []byte(response)
+				hexData := fmt.Sprintf("%x", responseBytes)
+				if colorEnabled {
+					fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+						colorBlue, conn.RemoteAddr().String(), colorReset,
+						colorYellow, timestamp, colorReset,
+						colorRed, colorReset, message,
+						colorCyan, len(responseBytes), colorReset,
+						colorPurple, hexData, colorReset)
+				} else {
+					fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n",
+						conn.RemoteAddr().String(), timestamp, message, len(responseBytes), hexData)
+				}
+			}
+		})
+		if stopClient {
+			return
 		}
 	}
 }
@@ -596,13 +705,14 @@ func processEscapeSequences(input string) string {
 
 func runClient() {
 	if len(os.Args) < 5 {
-		fmt.Println("Usage: -c, --client <IP> <port> <terminator> [--buffer-size <size>] [--color] [--no-color]")
-		fmt.Println("Terminator: LF (0A) or CR (0D)")
+		fmt.Println("Usage: -c, --client <IP> <port> <terminator> [-tt T] [-rt T] [--tx-term T] [--rx-term T] [--buffer-size <size>] [--color] [--no-color]")
+		fmt.Println("Terminator: LF, CR, or CRLF (positional sets both send and receive unless overridden)")
 		return
 	}
 
 	address := os.Args[2] + ":" + os.Args[3]
-	terminator := os.Args[4]
+	legacyTerminator := os.Args[4]
+	var sendTerminatorName, recvTerminatorName string
 	bufferSize := 1024  // Default buffer size
 	colorEnabled = true // Default color enabled
 
@@ -624,6 +734,20 @@ func runClient() {
 				fmt.Println("Error: Buffer size must be specified after --buffer-size")
 				return
 			}
+		} else if arg == "-tt" || arg == "--tx-term" || arg == "--send-terminator" {
+			if i+1 >= len(os.Args) {
+				fmt.Println("Error: Value required after -tt / --tx-term (LF, CR, or CRLF)")
+				return
+			}
+			sendTerminatorName = os.Args[i+1]
+			i++
+		} else if arg == "-rt" || arg == "--rx-term" || arg == "--recv-terminator" {
+			if i+1 >= len(os.Args) {
+				fmt.Println("Error: Value required after -rt / --rx-term (LF, CR, or CRLF)")
+				return
+			}
+			recvTerminatorName = os.Args[i+1]
+			i++
 		} else if arg == "--color" {
 			colorEnabled = true
 		} else if arg == "--no-color" {
@@ -631,15 +755,25 @@ func runClient() {
 		}
 	}
 
-	// Set terminator
-	var terminatorBytes []byte
-	switch strings.ToUpper(terminator) {
-	case "LF":
-		terminatorBytes = []byte{0x0A} // LF
-	case "CR":
-		terminatorBytes = []byte{0x0D} // CR
-	default:
-		fmt.Println("Error: Terminator must be 'LF' or 'CR'")
+	if !terminatorToken(legacyTerminator) {
+		fmt.Println("Error: Terminator must be LF, CR, or CRLF")
+		return
+	}
+	if sendTerminatorName == "" {
+		sendTerminatorName = legacyTerminator
+	}
+	if recvTerminatorName == "" {
+		recvTerminatorName = legacyTerminator
+	}
+
+	sendTerminatorBytes, err := parseTerminator(sendTerminatorName)
+	if err != nil {
+		fmt.Println("Error (-tt / --tx-term):", err)
+		return
+	}
+	recvTerminatorBytes, err := parseTerminator(recvTerminatorName)
+	if err != nil {
+		fmt.Println("Error (-rt / --rx-term):", err)
 		return
 	}
 
@@ -651,7 +785,8 @@ func runClient() {
 	defer conn.Close()
 
 	fmt.Println("Connection successful:", address)
-	fmt.Printf("Terminator: %s (0x%02X)\n", terminator, terminatorBytes[0])
+	fmt.Printf("Send terminator:    %s (%s)\n", strings.ToUpper(sendTerminatorName), terminatorHexDescription(sendTerminatorBytes))
+	fmt.Printf("Receive terminator: %s (%s)\n", strings.ToUpper(recvTerminatorName), terminatorHexDescription(recvTerminatorBytes))
 	fmt.Printf("Buffer size: %d bytes\n", bufferSize)
 	fmt.Println("Chat started. Enter messages:")
 	fmt.Println("----------------------------------------")
@@ -675,7 +810,8 @@ func runClient() {
 	go func() {
 		defer wg.Done()
 		buffer := make([]byte, bufferSize)
-		var messageBuffer strings.Builder
+		var messageBuffer bytes.Buffer
+		var pendingSkipLF bool
 		const timeoutDuration = 100 * time.Millisecond // Timeout for incomplete messages
 
 		for {
@@ -686,6 +822,9 @@ func runClient() {
 			// Check if it's a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Timeout occurred - display buffered data if any
+				if discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
+					continue
+				}
 				message := messageBuffer.String()
 				if message != "" {
 					outputMutex.Lock()
@@ -713,25 +852,27 @@ func runClient() {
 
 			if err != nil {
 				// Display any remaining buffered data before returning
-				message := messageBuffer.String()
-				if message != "" {
-					outputMutex.Lock()
-					fmt.Print("\r\033[K") // Clear current line
-					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-					messageBytes := []byte(message)
-					hexData := fmt.Sprintf("%x", messageBytes)
-					if colorEnabled {
-						fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-							colorGreen, colorReset,
-							colorYellow, timestamp, colorReset,
-							message,
-							colorCyan, len(messageBytes), colorReset,
-							colorPurple, hexData, colorReset)
-					} else {
-						fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
-							timestamp, message, len(messageBytes), hexData)
+				if !discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
+					message := messageBuffer.String()
+					if message != "" {
+						outputMutex.Lock()
+						fmt.Print("\r\033[K") // Clear current line
+						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+						messageBytes := []byte(message)
+						hexData := fmt.Sprintf("%x", messageBytes)
+						if colorEnabled {
+							fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+								colorGreen, colorReset,
+								colorYellow, timestamp, colorReset,
+								message,
+								colorCyan, len(messageBytes), colorReset,
+								colorPurple, hexData, colorReset)
+						} else {
+							fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
+								timestamp, message, len(messageBytes), hexData)
+						}
+						outputMutex.Unlock()
 					}
-					outputMutex.Unlock()
 				}
 				outputMutex.Lock()
 				fmt.Print("\r\033[K") // Clear current line before error message
@@ -742,6 +883,9 @@ func runClient() {
 
 			if n == 0 {
 				// Display any remaining buffered data when connection is closed gracefully
+				if discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
+					continue
+				}
 				message := messageBuffer.String()
 				if message != "" {
 					outputMutex.Lock()
@@ -767,37 +911,32 @@ func runClient() {
 				continue
 			}
 
-			// Process received data - wait for terminator like server side
+			// Process received data (frame by recv terminator suffix)
 			data := buffer[:n]
-			for _, b := range data {
-				messageBuffer.WriteByte(b)
-				if b == terminatorBytes[0] {
-					// Display message when terminator is found
-					messageBytes := []byte(messageBuffer.String())
-					if len(messageBytes) > 0 {
-						outputMutex.Lock()
-						fmt.Print("\r\033[K") // Clear current line
-						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-						// Display message without terminator for readability
-						displayMessage := strings.TrimSuffix(string(messageBytes), string(terminatorBytes))
-						hexData := fmt.Sprintf("%x", messageBytes)
-						if colorEnabled {
-							fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-								colorGreen, colorReset,
-								colorYellow, timestamp, colorReset,
-								displayMessage,
-								colorCyan, len(messageBytes), colorReset,
-								colorPurple, hexData, colorReset)
-						} else {
-							fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
-								timestamp, displayMessage, len(messageBytes), hexData)
-						}
-						fmt.Print("Send> ") // Re-display prompt
-						outputMutex.Unlock()
-					}
-					messageBuffer.Reset()
+			appendAndFlushBySuffix(&messageBuffer, data, recvTerminatorBytes, &pendingSkipLF, func(message string) {
+				if message == "" {
+					return
 				}
-			}
+				fullFrame := message + string(recvTerminatorBytes)
+				messageBytes := []byte(fullFrame)
+				outputMutex.Lock()
+				fmt.Print("\r\033[K") // Clear current line
+				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+				hexData := fmt.Sprintf("%x", messageBytes)
+				if colorEnabled {
+					fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+						colorGreen, colorReset,
+						colorYellow, timestamp, colorReset,
+						message,
+						colorCyan, len(messageBytes), colorReset,
+						colorPurple, hexData, colorReset)
+				} else {
+					fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
+						timestamp, message, len(messageBytes), hexData)
+				}
+				fmt.Print("Send> ") // Re-display prompt
+				outputMutex.Unlock()
+			})
 		}
 	}()
 
@@ -813,7 +952,7 @@ func runClient() {
 
 		// Process escape sequences and send with specified terminator
 		processedText := processEscapeSequences(text)
-		message := processedText + string(terminatorBytes)
+		message := processedText + string(sendTerminatorBytes)
 		_, err := conn.Write([]byte(message))
 		if err != nil {
 			fmt.Println("Send error:", err)
