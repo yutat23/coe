@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "0.1.4"
+const version = "0.1.5"
 
 // Color codes
 const (
@@ -140,7 +140,7 @@ func shortUsage() {
 	fmt.Println("")
 	fmt.Println("USAGE")
 	fmt.Println("  Server mode:  coe -s <port> [terminator] [options]")
-	fmt.Println("  Client mode:  coe -c <IP> <port> <terminator> [options]")
+	fmt.Println("  Client mode:  coe -c <IP> <port> [terminator] [options]")
 	fmt.Println("")
 	fmt.Println("Use 'coe --help' for detailed options and examples.")
 }
@@ -151,11 +151,11 @@ func fullUsage() {
 	fmt.Println("USAGE")
 	fmt.Println("  Server mode:   coe -s, --server <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
 	fmt.Println("                 [--no-echo] [--buffer-size <size>] [--color] [--no-color]")
-	fmt.Println("  Client mode:   coe -c, --client <IP> <port> <terminator> [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
+	fmt.Println("  Client mode:   coe -c, --client <IP> <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
 	fmt.Println("                 [--buffer-size <size>] [--color] [--no-color]")
 	fmt.Println("")
 	fmt.Println("OPTIONS")
-	fmt.Println("Terminator: LF, CR, or CRLF (CR+LF). Positional <terminator> sets both send and receive unless overridden.")
+	fmt.Println("Terminator: LF, CR, or CRLF (CR+LF). Positional sets both sides unless overridden; omit when -tt and -rt cover both.")
 	fmt.Println("-tt T, --tx-term T   Outgoing delimiter (#send/#broadcast, echo, client send); --send-terminator is an alias")
 	fmt.Println("-rt T, --rx-term T   Frame incoming data until this sequence; --recv-terminator is an alias")
 	fmt.Println("--no-echo        Disable echo back (Server mode only)")
@@ -186,6 +186,7 @@ func fullUsage() {
 	fmt.Println("  coe -s 8080 --color")
 	fmt.Println("  coe -s 8080 --no-color")
 	fmt.Println("  coe -c 127.0.0.1 8080 LF")
+	fmt.Println("  coe -c 127.0.0.1 8080 -tt CR -rt CRLF")
 	fmt.Println("  coe -c 127.0.0.1 8080 CR -rt CRLF")
 	fmt.Println("  coe --client 192.168.1.100 8080 CR --buffer-size 512 --color")
 	fmt.Println("  coe --client 192.168.1.100 8080 CR --no-color")
@@ -704,20 +705,29 @@ func processEscapeSequences(input string) string {
 }
 
 func runClient() {
-	if len(os.Args) < 5 {
-		fmt.Println("Usage: -c, --client <IP> <port> <terminator> [-tt T] [-rt T] [--tx-term T] [--rx-term T] [--buffer-size <size>] [--color] [--no-color]")
-		fmt.Println("Terminator: LF, CR, or CRLF (positional sets both send and receive unless overridden)")
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: -c, --client <IP> <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T] [--buffer-size <size>] [--color] [--no-color]")
+		fmt.Println("Terminator: LF, CR, or CRLF. Positional is optional if -tt and -rt specify send and receive.")
 		return
 	}
 
 	address := os.Args[2] + ":" + os.Args[3]
-	legacyTerminator := os.Args[4]
+	var legacyTerminator string
 	var sendTerminatorName, recvTerminatorName string
 	bufferSize := 1024  // Default buffer size
 	colorEnabled = true // Default color enabled
 
-	// Parse arguments
-	for i := 5; i < len(os.Args); i++ {
+	argi := 4
+	if argi < len(os.Args) && !strings.HasPrefix(os.Args[argi], "-") {
+		if !terminatorToken(os.Args[argi]) {
+			fmt.Println("Error: Terminator must be LF, CR, or CRLF (or omit and use -tt / -rt)")
+			return
+		}
+		legacyTerminator = os.Args[argi]
+		argi++
+	}
+
+	for i := argi; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		if arg == "--buffer-size" {
 			if i+1 < len(os.Args) {
@@ -752,18 +762,25 @@ func runClient() {
 			colorEnabled = true
 		} else if arg == "--no-color" {
 			colorEnabled = false
+		} else {
+			fmt.Printf("Error: Unknown option %s\n", arg)
+			return
 		}
 	}
 
-	if !terminatorToken(legacyTerminator) {
-		fmt.Println("Error: Terminator must be LF, CR, or CRLF")
-		return
+	if legacyTerminator != "" {
+		if sendTerminatorName == "" {
+			sendTerminatorName = legacyTerminator
+		}
+		if recvTerminatorName == "" {
+			recvTerminatorName = legacyTerminator
+		}
 	}
 	if sendTerminatorName == "" {
-		sendTerminatorName = legacyTerminator
+		sendTerminatorName = "LF"
 	}
 	if recvTerminatorName == "" {
-		recvTerminatorName = legacyTerminator
+		recvTerminatorName = "LF"
 	}
 
 	sendTerminatorBytes, err := parseTerminator(sendTerminatorName)
