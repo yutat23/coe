@@ -2,198 +2,95 @@
 
 ```
  ██████╗ ██████╗ ███████╗
-██╔════╝██╔═══██╗██╔═══█║
-██║     ██║   ██║███████║
-██║     ██║   ██║██╔════╝
+██╔════╝██╔═══██╗██╔════╝
+██║     ██║   ██║█████╗
+██║     ██║   ██║██╔══╝
 ╚██████╗╚██████╔╝███████╗
  ╚═════╝ ╚═════╝ ╚══════╝
 ```
 
-A simple TCP socket communication tool written in Go for basic server-client messaging with configurable terminators and optional echo functionality.
+coe is a small TCP socket communication tool for interactive server/client testing with configurable send and receive terminators.
 
 ## Features
 
-- **Server Mode**: Multi-client TCP server with interactive command interface
-- **Client Mode**: TCP client for connecting to servers
-- **Configurable Terminators**: Support for LF (0x0A) and CR (0x0D) terminators
-- **Echo Functionality**: Optional echo-back feature for server responses
-- **Colored Output**: Enhanced readability with color-coded messages and data
-- **Interactive Commands**: Server-side commands for client management
-- **Real-time Monitoring**: Live display of sent/received messages with timestamps
-- **Hexadecimal Data Display**: Raw data inspection with hex representation
-- **Buffer Size Configuration**: Customizable buffer sizes for different use cases
+- Server mode with multiple concurrent clients
+- Client mode for connecting to TCP servers
+- LF, CR, and CRLF terminators
+- Separate send and receive terminators with `-tt` and `-rt`
+- Optional server echo-back
+- Hex and byte-count logging
+- Escape sequences in sent messages: `\r`, `\n`, `\t`, `\\`, `\xHH`
+- Optional incomplete-frame flushing with `--flush-timeout`
 
 ## Installation
 
-### From Source
-
 ```bash
 git clone <repository-url>
-cd tcil
-go build -o coe coe.go
+cd coe
+go build -o coe .
 ```
 
-### Windows
+Windows:
 
 ```bash
-go build -o coe.exe coe.go
+go build -o coe.exe .
 ```
 
 ## Usage
 
-```
-coe <mode> [options]
-```
-
-### Modes
-
-- `-s`, `--server`: Run in server mode
-- `-c`, `--client`: Run in client mode
-- `-h`, `--help`, `help`: Show help message
-
-## Server Mode
-
-Start a TCP server that can handle multiple client connections:
-
-```bash
+```text
 coe -s <port> [terminator] [options]
+coe -c <IP> <port> [terminator] [options]
 ```
 
-### Server Options
+`terminator` can be `LF`, `CR`, or `CRLF`. If omitted, both send and receive default to `LF` unless overridden.
 
-- `<port>`: Port number to listen on (required)
-- `[terminator]`: Message terminator - LF (0x0A) or CR (0x0D) - Default: LF
-- `--no-echo`: Disable echo-back functionality
-- `--buffer-size <size>`: Specify buffer size in bytes - Default: 1024
-- `--color`: Enable colored output
+## Options
 
-### Server Commands
+- `-tt T`, `--tx-term T`, `--send-terminator T`: outgoing terminator
+- `-rt T`, `--rx-term T`, `--recv-terminator T`: incoming frame terminator
+- `--buffer-size <size>`: receive buffer size in bytes, default `1024`
+- `--flush-timeout <duration>`: display incomplete buffered data after inactivity, for example `100ms`; default off
+- `--color`: enable color output, default on
+- `--no-color`: disable color output
+- `--no-echo`: disable server echo-back, server mode only
 
-Once the server is running, you can use interactive commands:
+## Server Commands
 
-- `#send <clientIP> <message>`: Send a message to a specific client
-- `#broadcast <message>`: Send a message to all connected clients
-- `#list`: Show all connected clients
-- `#help`: Show server command help
-- `#quit`, `#exit`: Shut down the server
+- `#send <clientAddr> <message>`: send to one client. Use the `IP:port` value shown by `#list`.
+- `#broadcast <message>`: send to all clients
+- `#list`: show connected clients
+- `#help`: show server command help
+- `#help program`: show full program help
+- `#quit`, `#exit`: shut down the server
 
-### Server Examples
+## Examples
 
 ```bash
-# Start server on port 8080 with default settings
 coe -s 8080
+coe -s 8080 CR --no-echo
+coe -s 8080 -tt CR -rt CRLF
+coe -s 8080 --flush-timeout 100ms
 
-# Start server with CR terminator
-coe -s 8080 CR
-
-# Start server with disabled echo
-coe -s 8080 LF --no-echo
-
-# Start server with custom buffer size
-coe -s 8080 --buffer-size 2048
-
-# Start server with colored output
-coe -s 8080 --color
-
-# Combine multiple options
-coe -s 8080 CR --no-echo --buffer-size 512 --color
-```
-
-## Client Mode
-
-Connect to a TCP server as a client:
-
-```bash
-coe -c <IP> <port> <terminator> [options]
-```
-
-### Client Options
-
-- `<IP>`: Server IP address (required)
-- `<port>`: Server port number (required)
-- `<terminator>`: Message terminator - LF (0x0A) or CR (0x0D) (required)
-- `--buffer-size <size>`: Specify buffer size in bytes - Default: 1024
-- `--color`: Enable colored output
-
-### Client Examples
-
-```bash
-# Connect to localhost server
+coe -c 127.0.0.1 8080
 coe -c 127.0.0.1 8080 LF
-
-# Connect to remote server with CR terminator
-coe -c 192.168.1.100 8080 CR
-
-# Connect with custom buffer size
-coe -c 127.0.0.1 8080 LF --buffer-size 512
-
-# Connect with colored output
-coe -c 127.0.0.1 8080 LF --color
-
-# Combine options
-coe -c 192.168.1.100 8080 CR --buffer-size 2048 --color
+coe -c 127.0.0.1 8080 -tt CR -rt CRLF
+coe -c 192.168.1.100 8080 CR --buffer-size 512 --no-color
 ```
 
-## Color Coding
+## Message Processing
 
-When `--color` is enabled, the output uses the following color scheme:
+By default, received data is buffered until the configured receive terminator is found. This avoids splitting TCP data just because packets arrive in multiple chunks.
 
-- **Blue**: Client IP addresses
-- **Green**: Received messages
-- **Red**: Sent messages
-- **Yellow**: Timestamps
-- **Cyan**: Byte counts
-- **Purple**: Hexadecimal data
+For devices or protocols that do not send a terminator, use `--flush-timeout 100ms` or another duration. That mode displays incomplete buffered data after the connection has been idle for the requested time.
 
-## Escape Sequences
-
-Messages support escape sequences: `\r` (CR), `\n` (LF), `\t` (TAB), `\\` (backslash), `\xHH` (hex byte).
-
-Example: `Hello\r\nWorld` sends "Hello" + CR + LF + "World"
-
-## How It Works
-
-### Server Mode
-- Listens on the specified port for incoming TCP connections
-- Handles multiple clients concurrently using goroutines
-- Processes messages based on the configured terminator (LF or CR)
-- Provides interactive command interface for client management
-- Supports optional echo-back functionality
-- Displays real-time message logs with timestamps and metadata
-
-### Client Mode
-- Connects to a TCP server at the specified IP and port
-- Sends messages with the configured terminator
-- Receives and displays messages from the server
-- Shows detailed message information including byte counts and hex data
-- Runs send and receive operations concurrently
-
-### Message Processing
-- Messages are buffered until the terminator character is received
-- Supports both LF (Line Feed, 0x0A) and CR (Carriage Return, 0x0D) terminators
-- Displays message metadata including timestamps, byte counts, and hexadecimal representation
-- Configurable buffer sizes for different network conditions
-
-## Use Cases
-
-- **Network Protocol Testing**: Test custom protocols with different terminators
-- **Debugging Network Applications**: Monitor message flow with detailed logging
-- **IoT Device Communication**: Communicate with devices using specific terminators
-- **Load Testing**: Multiple clients can connect to test server performance
-- **Educational Purposes**: Learn about TCP socket programming and message framing
+Sent messages are processed for escape sequences before the configured send terminator is appended. For example, `Hello\r\nWorld` sends `Hello` followed by CRLF and `World`.
 
 ## Requirements
 
 - Go 1.24.4 or later
-- Network connectivity for client-server communication
+- Network connectivity for client/server communication
 
 ## Dependencies
 
-This application uses only Go standard library packages:
-- `net`: TCP socket communication
-- `bufio`: Buffered I/O operations
-- `fmt`: Formatted I/O
-- `os`: Operating system interface
-- `strings`: String manipulation
-- `sync`: Synchronization primitives
-- `time`: Time operations
+coe uses only the Go standard library.
