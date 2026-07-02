@@ -752,6 +752,15 @@ func TestRunServerAcceptsClientCommandsAndQuits(t *testing.T) {
 		conn := waitForTCP(t, "127.0.0.1:"+port)
 		defer conn.Close()
 
+		// Wait for the echo reply before issuing #send: handleClient only runs
+		// after the accept loop has stored the client, so the echo proves the
+		// server has registered this connection.
+		if _, err := conn.Write([]byte("ping\n")); err != nil {
+			t.Errorf("write ping error: %v", err)
+			return
+		}
+		readUntilContains(t, conn, "ping\n")
+
 		if _, err := fmt.Fprintf(stdinW, "#list\n"); err != nil {
 			t.Errorf("write #list error: %v", err)
 			return
