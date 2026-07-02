@@ -1,6 +1,6 @@
 # wingetパッケージ用ビルドスクリプト
 $appname = "coe"
-$version = "0.1.6"
+$version = "0.1.7"
 
 # リリースディレクトリを作成
 $releaseDir = "release"
