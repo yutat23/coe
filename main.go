@@ -490,6 +490,58 @@ func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte
 		}
 		n, err := conn.Read(buffer)
 
+		// Per io.Reader contract, process the returned bytes before handling err:
+		// the final data may be delivered together with io.EOF.
+		if n > 0 {
+			// Process received data (frame by recv terminator suffix)
+			data := buffer[:n]
+			stopClient := false
+			appendAndFlushBySuffix(&messageBuffer, data, recvTerminatorBytes, &pendingSkipLF, func(message string) {
+				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+				fullFrame := message + string(recvTerminatorBytes)
+				messageBytes := []byte(fullFrame)
+				hexData := fmt.Sprintf("%x", messageBytes)
+				if colorEnabled {
+					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+						colorBlue, conn.RemoteAddr().String(), colorReset,
+						colorYellow, timestamp, colorReset,
+						colorGreen, colorReset, message,
+						colorCyan, len(messageBytes), colorReset,
+						colorPurple, hexData, colorReset)
+				} else {
+					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
+						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
+				}
+
+				if echoEnabled {
+					response := message + string(sendTerminatorBytes)
+					_, err := conn.Write([]byte(response))
+					if err != nil {
+						fmt.Printf("[%s] Send error: %v\n", conn.RemoteAddr().String(), err)
+						stopClient = true
+						return
+					}
+					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+					responseBytes := []byte(response)
+					hexData := fmt.Sprintf("%x", responseBytes)
+					if colorEnabled {
+						fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+							colorBlue, conn.RemoteAddr().String(), colorReset,
+							colorYellow, timestamp, colorReset,
+							colorRed, colorReset, message,
+							colorCyan, len(responseBytes), colorReset,
+							colorPurple, hexData, colorReset)
+					} else {
+						fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n",
+							conn.RemoteAddr().String(), timestamp, message, len(responseBytes), hexData)
+					}
+				}
+			})
+			if stopClient {
+				return
+			}
+		}
+
 		// Check if it's a timeout error
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			// Timeout occurred - display buffered data if any
@@ -540,83 +592,6 @@ func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte
 			}
 			fmt.Printf("[%s] Receive error: %v\n", conn.RemoteAddr().String(), err)
 			break
-		}
-
-		if n == 0 {
-			// Display any remaining buffered data when connection is closed gracefully
-			if discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
-				continue
-			}
-			message := messageBuffer.String()
-			if message != "" {
-				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-				messageBytes := []byte(message)
-				hexData := fmt.Sprintf("%x", messageBytes)
-				if colorEnabled {
-					fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-						colorBlue, conn.RemoteAddr().String(), colorReset,
-						colorYellow, timestamp, colorReset,
-						colorGreen, colorReset, message,
-						colorCyan, len(messageBytes), colorReset,
-						colorPurple, hexData, colorReset)
-				} else {
-					fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
-						conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
-				}
-				messageBuffer.Reset()
-			}
-			continue
-		}
-
-		// Debug: Show received data details
-		// fmt.Printf("[%s] Debug: Received bytes=%d, data=%x\n", conn.RemoteAddr().String(), n, buffer[:n])
-
-		// Process received data (frame by recv terminator suffix)
-		data := buffer[:n]
-		stopClient := false
-		appendAndFlushBySuffix(&messageBuffer, data, recvTerminatorBytes, &pendingSkipLF, func(message string) {
-			timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-			fullFrame := message + string(recvTerminatorBytes)
-			messageBytes := []byte(fullFrame)
-			hexData := fmt.Sprintf("%x", messageBytes)
-			if colorEnabled {
-				fmt.Printf("%s[%s]%s %s%s%s | %sReceived:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-					colorBlue, conn.RemoteAddr().String(), colorReset,
-					colorYellow, timestamp, colorReset,
-					colorGreen, colorReset, message,
-					colorCyan, len(messageBytes), colorReset,
-					colorPurple, hexData, colorReset)
-			} else {
-				fmt.Printf("[%s] %s | Received: %s (Bytes: %d, HEX: %s)\n",
-					conn.RemoteAddr().String(), timestamp, message, len(messageBytes), hexData)
-			}
-
-			if echoEnabled {
-				response := message + string(sendTerminatorBytes)
-				_, err := conn.Write([]byte(response))
-				if err != nil {
-					fmt.Printf("[%s] Send error: %v\n", conn.RemoteAddr().String(), err)
-					stopClient = true
-					return
-				}
-				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-				responseBytes := []byte(response)
-				hexData := fmt.Sprintf("%x", responseBytes)
-				if colorEnabled {
-					fmt.Printf("%s[%s]%s %s%s%s | %sSent:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-						colorBlue, conn.RemoteAddr().String(), colorReset,
-						colorYellow, timestamp, colorReset,
-						colorRed, colorReset, message,
-						colorCyan, len(responseBytes), colorReset,
-						colorPurple, hexData, colorReset)
-				} else {
-					fmt.Printf("[%s] %s | Sent: %s (Bytes: %d, HEX: %s)\n",
-						conn.RemoteAddr().String(), timestamp, message, len(responseBytes), hexData)
-				}
-			}
-		})
-		if stopClient {
-			return
 		}
 	}
 }
@@ -928,6 +903,34 @@ func runClient() {
 			}
 			n, err := conn.Read(buffer)
 
+			// Per io.Reader contract, process the returned bytes before handling err:
+			// the final data may be delivered together with io.EOF.
+			if n > 0 {
+				// Process received data (frame by recv terminator suffix)
+				data := buffer[:n]
+				appendAndFlushBySuffix(&messageBuffer, data, recvTerminatorBytes, &pendingSkipLF, func(message string) {
+					fullFrame := message + string(recvTerminatorBytes)
+					messageBytes := []byte(fullFrame)
+					outputMutex.Lock()
+					clearInputLine()
+					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+					hexData := fmt.Sprintf("%x", messageBytes)
+					if colorEnabled {
+						fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+							colorGreen, colorReset,
+							colorYellow, timestamp, colorReset,
+							message,
+							colorCyan, len(messageBytes), colorReset,
+							colorPurple, hexData, colorReset)
+					} else {
+						fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
+							timestamp, message, len(messageBytes), hexData)
+					}
+					printPrompt("Send> ")
+					outputMutex.Unlock()
+				})
+			}
+
 			// Check if it's a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Timeout occurred - display buffered data if any
@@ -993,59 +996,6 @@ func runClient() {
 				return
 			}
 
-			if n == 0 {
-				// Display any remaining buffered data when connection is closed gracefully
-				if discardOrphanLFAfterCR(&messageBuffer, recvTerminatorBytes) {
-					continue
-				}
-				message := messageBuffer.String()
-				if message != "" {
-					outputMutex.Lock()
-					clearInputLine()
-					timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-					messageBytes := []byte(message)
-					hexData := fmt.Sprintf("%x", messageBytes)
-					if colorEnabled {
-						fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-							colorGreen, colorReset,
-							colorYellow, timestamp, colorReset,
-							message,
-							colorCyan, len(messageBytes), colorReset,
-							colorPurple, hexData, colorReset)
-					} else {
-						fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
-							timestamp, message, len(messageBytes), hexData)
-					}
-					printPrompt("Send> ")
-					outputMutex.Unlock()
-					messageBuffer.Reset()
-				}
-				continue
-			}
-
-			// Process received data (frame by recv terminator suffix)
-			data := buffer[:n]
-			appendAndFlushBySuffix(&messageBuffer, data, recvTerminatorBytes, &pendingSkipLF, func(message string) {
-				fullFrame := message + string(recvTerminatorBytes)
-				messageBytes := []byte(fullFrame)
-				outputMutex.Lock()
-				clearInputLine()
-				timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-				hexData := fmt.Sprintf("%x", messageBytes)
-				if colorEnabled {
-					fmt.Printf("%s[Recv]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
-						colorGreen, colorReset,
-						colorYellow, timestamp, colorReset,
-						message,
-						colorCyan, len(messageBytes), colorReset,
-						colorPurple, hexData, colorReset)
-				} else {
-					fmt.Printf("[Recv] %s | %s (Bytes: %d, HEX: %s)\n",
-						timestamp, message, len(messageBytes), hexData)
-				}
-				printPrompt("Send> ")
-				outputMutex.Unlock()
-			})
 		}
 	}()
 

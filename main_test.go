@@ -967,6 +967,43 @@ func TestHandleClientDoesNotEchoWhenDisabled(t *testing.T) {
 	waitDone(t, done)
 }
 
+// dataThenEOFConn returns its data together with io.EOF in a single Read call,
+// as real TCP connections may do when the peer sends and immediately closes.
+type dataThenEOFConn struct {
+	recordingConn
+	data []byte
+	read bool
+}
+
+func (c *dataThenEOFConn) Read(p []byte) (int, error) {
+	if c.read {
+		return 0, io.EOF
+	}
+	c.read = true
+	return copy(p, c.data), io.EOF
+}
+
+func TestHandleClientProcessesDataDeliveredWithEOF(t *testing.T) {
+	colorEnabled = false
+
+	conn := &dataThenEOFConn{data: []byte("hello\nworld")}
+	var clients sync.Map
+	var mu sync.RWMutex
+
+	out := captureStdout(t, func() {
+		handleClient(conn, []byte{'\n'}, []byte{'\n'}, true, &clients, &mu, 32, 0)
+	})
+
+	if got, want := conn.writes.String(), "hello\n"; got != want {
+		t.Fatalf("echo = %q (% x), want %q (% x)", got, got, want, want)
+	}
+	for _, want := range []string{"Received: hello", "Received: world"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q: %q", want, out)
+		}
+	}
+}
+
 func TestHandleClientReceivesCRAndDropsFollowingLF(t *testing.T) {
 	colorEnabled = false
 
