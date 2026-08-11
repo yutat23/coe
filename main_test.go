@@ -393,6 +393,7 @@ func TestProcessEscapeSequences(t *testing.T) {
 		{"hex uppercase", `A\x7F\xFF`, "A\x7f\xff"},
 		{"unknown escape kept", `a\qb`, `a\qb`},
 		{"invalid hex kept", `a\xG1b`, `a\xG1b`},
+		{"invalid second hex digit kept", `a\x1gb`, `a\x1gb`},
 		{"short hex kept", `a\x1`, `a\x1`},
 		{"trailing backslash kept", `a\`, `a\`},
 	}
@@ -410,12 +411,11 @@ func TestSendToClient(t *testing.T) {
 	colorEnabled = false
 
 	var clients sync.Map
-	var mu sync.RWMutex
 	conn := &recordingConn{}
 	clients.Store("client-1", conn)
 
 	out := captureStdout(t, func() {
-		sendToClient(&clients, &mu, "client-1", `hello\r\nworld`, []byte{'\n'})
+		sendToClient(&clients, "client-1", `hello\r\nworld`, []byte{'\n'})
 	})
 
 	if got, want := conn.writes.String(), "hello\r\nworld\n"; got != want {
@@ -428,10 +428,9 @@ func TestSendToClient(t *testing.T) {
 
 func TestSendToClientReportsMissingClient(t *testing.T) {
 	var clients sync.Map
-	var mu sync.RWMutex
 
 	out := captureStdout(t, func() {
-		sendToClient(&clients, &mu, "missing", "hello", []byte{'\n'})
+		sendToClient(&clients, "missing", "hello", []byte{'\n'})
 	})
 
 	if !strings.Contains(out, "Client not found: missing") {
@@ -441,11 +440,10 @@ func TestSendToClientReportsMissingClient(t *testing.T) {
 
 func TestSendToClientReportsWriteError(t *testing.T) {
 	var clients sync.Map
-	var mu sync.RWMutex
 	clients.Store("client-1", &recordingConn{err: errors.New("write failed")})
 
 	out := captureStdout(t, func() {
-		sendToClient(&clients, &mu, "client-1", "hello", []byte{'\n'})
+		sendToClient(&clients, "client-1", "hello", []byte{'\n'})
 	})
 
 	if !strings.Contains(out, "Send error [client-1]: write failed") {
@@ -457,14 +455,13 @@ func TestBroadcastToAll(t *testing.T) {
 	colorEnabled = false
 
 	var clients sync.Map
-	var mu sync.RWMutex
 	conn1 := &recordingConn{}
 	conn2 := &recordingConn{}
 	clients.Store("client-1", conn1)
 	clients.Store("client-2", conn2)
 
 	out := captureStdout(t, func() {
-		broadcastToAll(&clients, &mu, `ping\tpong`, []byte{'\r', '\n'})
+		broadcastToAll(&clients, `ping\tpong`, []byte{'\r', '\n'})
 	})
 
 	for name, conn := range map[string]*recordingConn{"client-1": conn1, "client-2": conn2} {
@@ -479,12 +476,11 @@ func TestBroadcastToAll(t *testing.T) {
 
 func TestBroadcastToAllCountsOnlySuccessfulWrites(t *testing.T) {
 	var clients sync.Map
-	var mu sync.RWMutex
 	clients.Store("ok", &recordingConn{})
 	clients.Store("bad", &recordingConn{err: errors.New("write failed")})
 
 	out := captureStdout(t, func() {
-		broadcastToAll(&clients, &mu, "ping", []byte{'\n'})
+		broadcastToAll(&clients, "ping", []byte{'\n'})
 	})
 
 	if !strings.Contains(out, "Send error [bad]: write failed") {
@@ -497,12 +493,11 @@ func TestBroadcastToAllCountsOnlySuccessfulWrites(t *testing.T) {
 
 func TestListClients(t *testing.T) {
 	var clients sync.Map
-	var mu sync.RWMutex
 	clients.Store("client-1", &recordingConn{})
 	clients.Store("client-2", &recordingConn{})
 
 	out := captureStdout(t, func() {
-		listClients(&clients, &mu)
+		listClients(&clients)
 	})
 
 	for _, want := range []string{"Connected clients:", "client-1", "client-2", "Total: 2 clients"} {
@@ -514,10 +509,9 @@ func TestListClients(t *testing.T) {
 
 func TestListClientsWhenEmpty(t *testing.T) {
 	var clients sync.Map
-	var mu sync.RWMutex
 
 	out := captureStdout(t, func() {
-		listClients(&clients, &mu)
+		listClients(&clients)
 	})
 
 	if !strings.Contains(out, "No clients connected") {
@@ -527,9 +521,7 @@ func TestListClientsWhenEmpty(t *testing.T) {
 
 func TestShowLogoAndUsageOutput(t *testing.T) {
 	out := captureStdout(t, func() {
-		if err := showLogo(); err != nil {
-			t.Fatalf("showLogo() returned error: %v", err)
-		}
+		showLogo()
 		shortUsage()
 		fullUsage()
 		printServerHelp()
@@ -617,6 +609,11 @@ func TestRunClientArgumentValidation(t *testing.T) {
 			want: "Error: Buffer size must be 1 or greater",
 		},
 		{
+			name: "buffer size with trailing junk",
+			args: []string{"coe", "-c", "127.0.0.1", "1234", "--buffer-size", "10x"},
+			want: "Error: Buffer size must be a number",
+		},
+		{
 			name: "missing flush timeout",
 			args: []string{"coe", "-c", "127.0.0.1", "1234", "--flush-timeout"},
 			want: "Error: Flush timeout must be specified after --flush-timeout",
@@ -688,6 +685,11 @@ func TestRunServerArgumentValidation(t *testing.T) {
 			name: "zero buffer size",
 			args: []string{"coe", "-s", "1234", "--buffer-size", "0"},
 			want: "Error: Buffer size must be 1 or greater",
+		},
+		{
+			name: "buffer size with trailing junk",
+			args: []string{"coe", "-s", "1234", "--buffer-size", "10x"},
+			want: "Error: Buffer size must be a number",
 		},
 		{
 			name: "missing flush timeout",
@@ -925,12 +927,10 @@ func TestHandleClientEchoesCompleteFrames(t *testing.T) {
 	colorEnabled = false
 
 	server, client := net.Pipe()
-	var clients sync.Map
-	var mu sync.RWMutex
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\r', '\n'}, true, &clients, &mu, 2, 0)
+		handleClient(server, []byte{'\n'}, []byte{'\r', '\n'}, true, 2, 0)
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -950,12 +950,10 @@ func TestHandleClientDoesNotEchoWhenDisabled(t *testing.T) {
 	colorEnabled = false
 
 	server, client := net.Pipe()
-	var clients sync.Map
-	var mu sync.RWMutex
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\n'}, false, &clients, &mu, 8, 0)
+		handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 8, 0)
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -996,11 +994,9 @@ func TestHandleClientProcessesDataDeliveredWithEOF(t *testing.T) {
 	colorEnabled = false
 
 	conn := &dataThenEOFConn{data: []byte("hello\nworld")}
-	var clients sync.Map
-	var mu sync.RWMutex
 
 	out := captureStdout(t, func() {
-		handleClient(conn, []byte{'\n'}, []byte{'\n'}, true, &clients, &mu, 32, 0)
+		handleClient(conn, []byte{'\n'}, []byte{'\n'}, true, 32, 0)
 	})
 
 	if got, want := conn.writes.String(), "hello\n"; got != want {
@@ -1017,12 +1013,10 @@ func TestHandleClientReceivesCRAndDropsFollowingLF(t *testing.T) {
 	colorEnabled = false
 
 	server, client := net.Pipe()
-	var clients sync.Map
-	var mu sync.RWMutex
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\r'}, []byte{'\n'}, true, &clients, &mu, 32, 0)
+		handleClient(server, []byte{'\r'}, []byte{'\n'}, true, 32, 0)
 	}()
 
 	if _, err := client.Write([]byte("hello\r\nworld\r")); err != nil {
