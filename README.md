@@ -11,6 +11,8 @@
 
 coe is a small TCP socket communication tool for interactive server/client testing with configurable send and receive terminators.
 
+The name comes from *koe* (声), Japanese for "voice" — the tool is there to let two endpoints talk to each other.
+
 ## Features
 
 - Server mode with multiple concurrent clients
