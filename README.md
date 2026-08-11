@@ -21,6 +21,8 @@ coe is a small TCP socket communication tool for interactive server/client testi
 - Hex and byte-count logging
 - Escape sequences in sent messages: `\r`, `\n`, `\t`, `\\`, `\xHH`
 - Optional incomplete-frame flushing with `--flush-timeout`
+- One-shot client sends with `-m` / `--message`
+- Time-based response waiting with `--wait` and script-friendly output with `--quiet`
 
 ## Installation
 
@@ -51,6 +53,9 @@ coe -c <IP> <port> [terminator] [options]
 - `-rt T`, `--rx-term T`, `--recv-terminator T`: incoming frame terminator
 - `--buffer-size <size>`: receive buffer size in bytes, default `1024`
 - `--flush-timeout <duration>`: display incomplete buffered data after inactivity, for example `100ms`; default off
+- `-m <message>`, `--message <message>`: send one message and exit without starting the interactive prompt
+- `--wait <duration>`: after a one-shot send, receive frames for this duration; omitted means fire-and-forget
+- `--quiet`: in one-shot mode, write response payloads (one line per frame) to stdout and connection/log output to stderr
 - `--color`: enable color output, default on
 - `--no-color`: disable color output
 - `--no-echo`: disable server echo-back, server mode only
@@ -76,7 +81,10 @@ coe -c 127.0.0.1 8080
 coe -c 127.0.0.1 8080 LF
 coe -c 127.0.0.1 8080 -tt CR -rt CRLF
 coe -c 192.168.1.100 8080 CR --buffer-size 512 --no-color
+coe -c 127.0.0.1 8080 -m "STATUS\\r" --wait 1s --quiet
 ```
+
+When `--wait` is specified, exit status `3` means that no response frame arrived before the wait period ended. A successful connection and send returns `0`; connection failures return `1`, and send failures return `2`.
 
 ## Message Processing
 
