@@ -67,6 +67,50 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(out)
 }
 
+func captureStdoutAndStderr(t *testing.T, fn func()) (string, string) {
+	t.Helper()
+
+	originalStdout := os.Stdout
+	originalStderr := os.Stderr
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout os.Pipe() error: %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		t.Fatalf("stderr os.Pipe() error: %v", err)
+	}
+
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+	defer func() {
+		os.Stdout = originalStdout
+		os.Stderr = originalStderr
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+	}()
+
+	fn()
+	if err := stdoutW.Close(); err != nil {
+		t.Fatalf("stdout pipe close error: %v", err)
+	}
+	if err := stderrW.Close(); err != nil {
+		t.Fatalf("stderr pipe close error: %v", err)
+	}
+
+	stdout, err := io.ReadAll(stdoutR)
+	if err != nil {
+		t.Fatalf("stdout pipe read error: %v", err)
+	}
+	stderr, err := io.ReadAll(stderrR)
+	if err != nil {
+		t.Fatalf("stderr pipe read error: %v", err)
+	}
+	return string(stdout), string(stderr)
+}
+
 func captureStdoutWithArgs(t *testing.T, args []string, fn func()) string {
 	t.Helper()
 
@@ -657,6 +701,187 @@ func TestRunClientArgumentValidation(t *testing.T) {
 				t.Fatalf("output missing %q: %q", tt.want, out)
 			}
 		})
+	}
+}
+
+func TestParseWaitDuration(t *testing.T) {
+	tests := []struct {
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{value: "500ms", want: 500 * time.Millisecond},
+		{value: "1s", want: time.Second},
+		{value: "0", want: 0},
+		{value: "-1s", wantErr: true},
+		{value: "later", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			got, err := parseWaitDuration(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseWaitDuration(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Fatalf("parseWaitDuration(%q) = %s, want %s", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunOneShotClientQuietWaitsForMultipleFrames(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		reader := bufio.NewReader(conn)
+		got, err := reader.ReadString('\n')
+		if err != nil {
+			t.Errorf("ReadString() error: %v", err)
+			return
+		}
+		if got != "STATUS\r\n" {
+			t.Errorf("request = %q, want escaped CR followed by LF terminator", got)
+			return
+		}
+		if _, err := conn.Write([]byte("one\ntwo\n")); err != nil {
+			t.Errorf("response write error: %v", err)
+			return
+		}
+		// Keep the connection open so the client must use the complete wait
+		// duration instead of stopping after the first response frame.
+		time.Sleep(180 * time.Millisecond)
+	}()
+
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	var code int
+	started := time.Now()
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", "127.0.0.1", port, "-m", `STATUS\r`, "--wait", "120ms", "--quiet", "--no-color"}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	elapsed := time.Since(started)
+	<-serverDone
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "one\ntwo\n" {
+		t.Fatalf("quiet stdout = %q, want one line per response frame", stdout)
+	}
+	if strings.Contains(stdout, "Connection successful") || strings.Contains(stdout, "Recv]") {
+		t.Fatalf("quiet stdout contains log output: %q", stdout)
+	}
+	if !strings.Contains(stderr, "Connection successful:") || !strings.Contains(stderr, "[Send]") {
+		t.Fatalf("quiet stderr missing connection/send logs: %q", stderr)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("client returned after %s, want it to honor the wait duration", elapsed)
+	}
+}
+
+func TestRunOneShotClientWithoutWaitIsFireAndForget(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		got, err := reader.ReadString('\n')
+		if err != nil {
+			t.Errorf("ReadString() error: %v", err)
+			return
+		}
+		if got != "PING\n" {
+			t.Errorf("request = %q, want PING LF", got)
+		}
+	}()
+
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	var code int
+	stdout, _ := captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", "127.0.0.1", port, "-m", "PING", "--quiet", "--no-color"}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	<-serverDone
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if stdout != "" {
+		t.Fatalf("fire-and-forget stdout = %q, want no response output", stdout)
+	}
+}
+
+func TestRunOneShotClientWaitReturnsThreeWithoutResponse(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Errorf("ReadString() error: %v", err)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	var code int
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", "127.0.0.1", port, "-m", "PING", "--wait", "30ms", "--quiet", "--no-color"}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	<-serverDone
+
+	if code != 3 {
+		t.Fatalf("exit code = %d, want 3; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("no-response stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "No response received") {
+		t.Fatalf("stderr = %q, want no-response message", stderr)
 	}
 }
 
