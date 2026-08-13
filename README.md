@@ -8,6 +8,7 @@
 ╚██████╗╚██████╔╝███████╗
  ╚═════╝ ╚═════╝ ╚══════╝
 ```
+<img width="1168" height="795" alt="image" src="https://github.com/user-attachments/assets/51aabeeb-ff85-4aee-ba52-a415b144f06e" />
 
 coe is a small TCP socket communication tool for interactive server/client testing with configurable send and receive terminators.
 
