@@ -20,8 +20,31 @@ if (Test-Path $exePath) {
 
 # Add to PATH if not already present
 $currentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($currentPath -notlike "*$InstallLocation*") {
-    [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$InstallLocation", "User")
+if ($null -eq $currentPath) {
+    $currentPath = ""
+}
+
+function Normalize-PathForCompare([string]$p) {
+    if ([string]::IsNullOrWhiteSpace($p)) {
+        return ""
+    }
+    return $p.Trim().TrimEnd('\').ToLowerInvariant()
+}
+
+$installNorm = Normalize-PathForCompare $InstallLocation
+$alreadyOnPath = $false
+foreach ($part in ($currentPath -split ';')) {
+    if ((Normalize-PathForCompare $part) -eq $installNorm) {
+        $alreadyOnPath = $true
+        break
+    }
+}
+if (-not $alreadyOnPath) {
+    if ([string]::IsNullOrWhiteSpace($currentPath)) {
+        [Environment]::SetEnvironmentVariable("PATH", $InstallLocation, "User")
+    } else {
+        [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$InstallLocation", "User")
+    }
     Write-Host "Added coe to PATH" -ForegroundColor Green
 }
 

@@ -1,6 +1,19 @@
 # wingetパッケージ用ビルドスクリプト
+$ErrorActionPreference = "Stop"
 $appname = "coe"
 $version = "0.1.8"
+
+function Invoke-CoeBuild {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFile
+    )
+
+    go build -o $OutputFile -ldflags "-s -w" main.go
+    if ($LASTEXITCODE -ne 0) {
+        throw "go build failed: $OutputFile (exit $LASTEXITCODE)"
+    }
+}
 
 # リリースディレクトリを作成
 $releaseDir = "release"
@@ -25,7 +38,7 @@ if (!(Test-Path $releaseDir)) {
     New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
     # Goアプリケーションをビルド
-    go build -o $outputFile -ldflags "-s -w" main.go
+    Invoke-CoeBuild -OutputFile $outputFile
 
     # インストーラースクリプトをコピー
     Copy-Item "installer.ps1" "$buildDir/"
@@ -61,7 +74,7 @@ if (!(Test-Path $releaseDir)) {
     New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
     # Goアプリケーションをビルド
-    go build -o $outputFile -ldflags "-s -w" main.go
+    Invoke-CoeBuild -OutputFile $outputFile
 
     # ZIP化
     $zipPath = "$releaseDir/$appname" + "_$version" + "_$target.zip"
@@ -94,7 +107,7 @@ if (!(Test-Path $releaseDir)) {
     New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
     # Goアプリケーションをビルド
-    go build -o $outputFile -ldflags "-s -w" main.go
+    Invoke-CoeBuild -OutputFile $outputFile
 
     # ZIP化
     $zipPath = "$releaseDir/$appname" + "_$version" + "_$target.zip"

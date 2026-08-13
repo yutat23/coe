@@ -343,9 +343,11 @@ func TestAppendAndFlushBySuffix(t *testing.T) {
 			var messages []string
 
 			for _, chunk := range tt.chunks {
-				appendAndFlushBySuffix(&buf, []byte(chunk), tt.recvTerm, &pendingSkipLF, func(msg string) {
+				if err := appendAndFlushBySuffix(&buf, []byte(chunk), tt.recvTerm, &pendingSkipLF, 0, func(msg string) {
 					messages = append(messages, msg)
-				})
+				}); err != nil {
+					t.Fatalf("appendAndFlushBySuffix() error: %v", err)
+				}
 			}
 			if !reflect.DeepEqual(messages, tt.wantMessages) {
 				t.Fatalf("messages = %q, want %q", messages, tt.wantMessages)
@@ -459,7 +461,7 @@ func TestSendToClient(t *testing.T) {
 	clients.Store("client-1", conn)
 
 	out := captureStdout(t, func() {
-		sendToClient(&clients, "client-1", `hello\r\nworld`, []byte{'\n'})
+		sendToClient(&clients, "client-1", `hello\r\nworld`, []byte{'\n'}, 0)
 	})
 
 	if got, want := conn.writes.String(), "hello\r\nworld\n"; got != want {
@@ -474,7 +476,7 @@ func TestSendToClientReportsMissingClient(t *testing.T) {
 	var clients sync.Map
 
 	out := captureStdout(t, func() {
-		sendToClient(&clients, "missing", "hello", []byte{'\n'})
+		sendToClient(&clients, "missing", "hello", []byte{'\n'}, 0)
 	})
 
 	if !strings.Contains(out, "Client not found: missing") {
@@ -487,7 +489,7 @@ func TestSendToClientReportsWriteError(t *testing.T) {
 	clients.Store("client-1", &recordingConn{err: errors.New("write failed")})
 
 	out := captureStdout(t, func() {
-		sendToClient(&clients, "client-1", "hello", []byte{'\n'})
+		sendToClient(&clients, "client-1", "hello", []byte{'\n'}, 0)
 	})
 
 	if !strings.Contains(out, "Send error [client-1]: write failed") {
@@ -505,7 +507,7 @@ func TestBroadcastToAll(t *testing.T) {
 	clients.Store("client-2", conn2)
 
 	out := captureStdout(t, func() {
-		broadcastToAll(&clients, `ping\tpong`, []byte{'\r', '\n'})
+		broadcastToAll(&clients, `ping\tpong`, []byte{'\r', '\n'}, 0)
 	})
 
 	for name, conn := range map[string]*recordingConn{"client-1": conn1, "client-2": conn2} {
@@ -524,7 +526,7 @@ func TestBroadcastToAllCountsOnlySuccessfulWrites(t *testing.T) {
 	clients.Store("bad", &recordingConn{err: errors.New("write failed")})
 
 	out := captureStdout(t, func() {
-		broadcastToAll(&clients, "ping", []byte{'\n'})
+		broadcastToAll(&clients, "ping", []byte{'\n'}, 0)
 	})
 
 	if !strings.Contains(out, "Send error [bad]: write failed") {
@@ -588,30 +590,40 @@ func TestShowLogoAndUsageOutput(t *testing.T) {
 
 func TestMainArgumentHandling(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		want []string
+		name     string
+		args     []string
+		want     []string
+		wantCode int
 	}{
 		{
-			name: "no args shows short usage",
-			args: []string{"coe"},
-			want: []string{"USAGE", "Use 'coe --help'"},
+			name:     "no args shows short usage",
+			args:     []string{"coe"},
+			want:     []string{"USAGE", "Use 'coe --help'"},
+			wantCode: 0,
 		},
 		{
-			name: "help shows full usage",
-			args: []string{"coe", "--help"},
-			want: []string{"OPTIONS", "EXAMPLES", "ESCAPE SEQUENCES"},
+			name:     "help shows full usage",
+			args:     []string{"coe", "--help"},
+			want:     []string{"OPTIONS", "EXAMPLES", "ESCAPE SEQUENCES"},
+			wantCode: 0,
 		},
 		{
-			name: "invalid mode reports error",
-			args: []string{"coe", "--bad"},
-			want: []string{"Error: Mode must be", "USAGE"},
+			name:     "invalid mode reports error",
+			args:     []string{"coe", "--bad"},
+			want:     []string{"Error: Mode must be", "USAGE"},
+			wantCode: 2,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := captureStdoutWithArgs(t, tt.args, main)
+			var code int
+			out := captureStdoutWithArgs(t, tt.args, func() {
+				code = runMain()
+			})
+			if code != tt.wantCode {
+				t.Fatalf("exit code = %d, want %d; output=%q", code, tt.wantCode, out)
+			}
 			for _, want := range tt.want {
 				if !strings.Contains(out, want) {
 					t.Fatalf("output missing %q: %q", want, out)
@@ -692,11 +704,27 @@ func TestRunClientArgumentValidation(t *testing.T) {
 			args: []string{"coe", "-c", "127.0.0.1", "1234", "--bad"},
 			want: "Error: Unknown option --bad",
 		},
+		{
+			name: "missing max frame size",
+			args: []string{"coe", "-c", "127.0.0.1", "1234", "--max-frame-size"},
+			want: "Error: Max frame size must be specified after --max-frame-size",
+		},
+		{
+			name: "missing write timeout",
+			args: []string{"coe", "-c", "127.0.0.1", "1234", "--write-timeout"},
+			want: "Error: Write timeout must be specified after --write-timeout",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := captureStdoutWithArgs(t, tt.args, runClient)
+			var code int
+			out := captureStdoutWithArgs(t, tt.args, func() {
+				code = runClientWithExitCode()
+			})
+			if code != exitUsage {
+				t.Fatalf("exit code = %d, want %d; output=%q", code, exitUsage, out)
+			}
 			if !strings.Contains(out, tt.want) {
 				t.Fatalf("output missing %q: %q", tt.want, out)
 			}
@@ -951,11 +979,42 @@ func TestRunServerArgumentValidation(t *testing.T) {
 			args: []string{"coe", "-s", "1234", "--bad"},
 			want: "Error: Unknown option or terminator --bad",
 		},
+		{
+			name: "missing max frame size",
+			args: []string{"coe", "-s", "1234", "--max-frame-size"},
+			want: "Error: Max frame size must be specified after --max-frame-size",
+		},
+		{
+			name: "negative max frame size",
+			args: []string{"coe", "-s", "1234", "--max-frame-size", "-1"},
+			want: "Error: Max frame size must be 0 or greater",
+		},
+		{
+			name: "missing max clients",
+			args: []string{"coe", "-s", "1234", "--max-clients"},
+			want: "Error: Max clients must be specified after --max-clients",
+		},
+		{
+			name: "missing write timeout",
+			args: []string{"coe", "-s", "1234", "--write-timeout"},
+			want: "Error: Write timeout must be specified after --write-timeout",
+		},
+		{
+			name: "invalid write timeout",
+			args: []string{"coe", "-s", "1234", "--write-timeout", "-1s"},
+			want: "Error: write timeout must be 0 or greater",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := captureStdoutWithArgs(t, tt.args, runServer)
+			var code int
+			out := captureStdoutWithArgs(t, tt.args, func() {
+				code = runServer()
+			})
+			if code != exitUsage {
+				t.Fatalf("exit code = %d, want %d; output=%q", code, exitUsage, out)
+			}
 			if !strings.Contains(out, tt.want) {
 				t.Fatalf("output missing %q: %q", tt.want, out)
 			}
@@ -1014,7 +1073,9 @@ func TestRunServerAcceptsClientCommandsAndQuits(t *testing.T) {
 		}
 	}()
 
-	out := captureStdoutWithArgsAndStdin(t, []string{"coe", "-s", port, "LF", "--no-color"}, stdinR, runServer)
+	out := captureStdoutWithArgsAndStdin(t, []string{"coe", "-s", port, "LF", "--no-color"}, stdinR, func() {
+		_ = runServer()
+	})
 	<-driverDone
 
 	for _, want := range []string{
@@ -1155,7 +1216,7 @@ func TestHandleClientEchoesCompleteFrames(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\r', '\n'}, true, 2, 0)
+		handleClient(server, []byte{'\n'}, []byte{'\r', '\n'}, true, 2, 0, 0, 0)
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -1178,7 +1239,7 @@ func TestHandleClientDoesNotEchoWhenDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 8, 0)
+		handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 8, 0, 0, 0)
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -1221,7 +1282,7 @@ func TestHandleClientProcessesDataDeliveredWithEOF(t *testing.T) {
 	conn := &dataThenEOFConn{data: []byte("hello\nworld")}
 
 	out := captureStdout(t, func() {
-		handleClient(conn, []byte{'\n'}, []byte{'\n'}, true, 32, 0)
+		handleClient(conn, []byte{'\n'}, []byte{'\n'}, true, 32, 0, 0, 0)
 	})
 
 	if got, want := conn.writes.String(), "hello\n"; got != want {
@@ -1241,7 +1302,7 @@ func TestHandleClientReceivesCRAndDropsFollowingLF(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\r'}, []byte{'\n'}, true, 32, 0)
+		handleClient(server, []byte{'\r'}, []byte{'\n'}, true, 32, 0, 0, 0)
 	}()
 
 	if _, err := client.Write([]byte("hello\r\nworld\r")); err != nil {
@@ -1255,4 +1316,375 @@ func TestHandleClientReceivesCRAndDropsFollowingLF(t *testing.T) {
 		t.Fatalf("client close error: %v", err)
 	}
 	waitDone(t, done)
+}
+
+func TestSplitHead(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantHead string
+		wantRest string
+	}{
+		{"#send addr A  B", "#send", "addr A  B"},
+		{"  #broadcast  hello", "#broadcast", " hello"},
+		{"#list", "#list", ""},
+		{"   ", "", ""},
+		{"#send addr", "#send", "addr"},
+	}
+	for _, tt := range tests {
+		head, rest := splitHead(tt.in)
+		if head != tt.wantHead || rest != tt.wantRest {
+			t.Fatalf("splitHead(%q) = %q, %q; want %q, %q", tt.in, head, rest, tt.wantHead, tt.wantRest)
+		}
+	}
+
+	addr, message := splitHead("addr A  B")
+	if addr != "addr" || message != "A  B" {
+		t.Fatalf("send payload split = %q, %q; want addr, %q", addr, message, "A  B")
+	}
+}
+
+func TestParseClientConfigIPv6AndIPv4(t *testing.T) {
+	original := os.Args
+	defer func() { os.Args = original }()
+
+	os.Args = []string{"coe", "-c", "::1", "8080"}
+	cfg, err := parseClientConfig()
+	if err != nil {
+		t.Fatalf("IPv6 parseClientConfig() error: %v", err)
+	}
+	if cfg.address != "[::1]:8080" {
+		t.Fatalf("IPv6 address = %q, want [::1]:8080", cfg.address)
+	}
+
+	os.Args = []string{"coe", "-c", "127.0.0.1", "8080"}
+	cfg, err = parseClientConfig()
+	if err != nil {
+		t.Fatalf("IPv4 parseClientConfig() error: %v", err)
+	}
+	if cfg.address != "127.0.0.1:8080" {
+		t.Fatalf("IPv4 address = %q, want 127.0.0.1:8080", cfg.address)
+	}
+}
+
+func TestParseMaxFrameSizeAndMaxClients(t *testing.T) {
+	got, err := parseMaxFrameSize("0")
+	if err != nil || got != 0 {
+		t.Fatalf("parseMaxFrameSize(0) = %d, %v", got, err)
+	}
+	if _, err := parseMaxFrameSize("-1"); err == nil {
+		t.Fatal("parseMaxFrameSize(-1) succeeded")
+	}
+	got, err = parseMaxClients("64")
+	if err != nil || got != 64 {
+		t.Fatalf("parseMaxClients(64) = %d, %v", got, err)
+	}
+	d, err := parseWriteTimeout("5s")
+	if err != nil || d != 5*time.Second {
+		t.Fatalf("parseWriteTimeout(5s) = %s, %v", d, err)
+	}
+	d, err = parseWriteTimeout("off")
+	if err != nil || d != 0 {
+		t.Fatalf("parseWriteTimeout(off) = %s, %v", d, err)
+	}
+}
+
+func TestAppendAndFlushBySuffixMaxFrameSize(t *testing.T) {
+	var buf bytes.Buffer
+	var pendingSkipLF bool
+	var messages []string
+	err := appendAndFlushBySuffix(&buf, []byte("hello\n"), []byte{'\n'}, &pendingSkipLF, 4, func(msg string) {
+		messages = append(messages, msg)
+	})
+	if !errors.Is(err, errFrameTooLarge) {
+		t.Fatalf("error = %v, want errFrameTooLarge", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("messages = %q, want none", messages)
+	}
+
+	buf.Reset()
+	pendingSkipLF = false
+	err = appendAndFlushBySuffix(&buf, []byte("ok\n"), []byte{'\n'}, &pendingSkipLF, 4, func(msg string) {
+		messages = append(messages, msg)
+	})
+	if err != nil {
+		t.Fatalf("appendAndFlushBySuffix() error: %v", err)
+	}
+	if len(messages) != 1 || messages[0] != "ok" {
+		t.Fatalf("messages = %q, want [ok]", messages)
+	}
+}
+
+func TestWriteConnTimesOut(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- writeConn(server, []byte("hello"), 30*time.Millisecond)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("writeConn succeeded, want timeout")
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("writeConn error = %v, want timeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writeConn did not return")
+	}
+}
+
+func TestHandleClientDropsOversizedFrame(t *testing.T) {
+	colorEnabled = false
+
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	var out string
+	go func() {
+		defer close(done)
+		out = captureStdout(t, func() {
+			handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 32, 0, 4, 0)
+		})
+	}()
+
+	if _, err := client.Write([]byte("hello\n")); err != nil {
+		t.Fatalf("client write error: %v", err)
+	}
+	waitDone(t, done)
+	_ = client.Close()
+
+	if !strings.Contains(out, "frame exceeds max size") {
+		t.Fatalf("output = %q, want max-frame error", out)
+	}
+}
+
+func TestBroadcastWriteTimeoutDropsClient(t *testing.T) {
+	colorEnabled = false
+
+	blocked, peer := net.Pipe()
+	defer peer.Close()
+
+	okConn := &recordingConn{}
+	var clients sync.Map
+	clients.Store("blocked", blocked)
+	clients.Store("ok", okConn)
+
+	out := captureStdout(t, func() {
+		broadcastToAll(&clients, "hello", []byte{'\n'}, 30*time.Millisecond)
+	})
+	_ = blocked.Close()
+
+	if _, stillThere := clients.Load("blocked"); stillThere {
+		t.Fatal("blocked client was not dropped after write timeout")
+	}
+	if got, want := okConn.writes.String(), "hello\n"; got != want {
+		t.Fatalf("successful client write = %q, want %q", got, want)
+	}
+	if !strings.Contains(out, "Broadcast completed: sent to 1 clients") {
+		t.Fatalf("output = %q, want successful count of 1", out)
+	}
+}
+
+func TestSendToClientWriteTimeoutDropsClient(t *testing.T) {
+	colorEnabled = false
+
+	blocked, peer := net.Pipe()
+	defer peer.Close()
+
+	var clients sync.Map
+	clients.Store("blocked", blocked)
+
+	out := captureStdout(t, func() {
+		sendToClient(&clients, "blocked", "hello", []byte{'\n'}, 30*time.Millisecond)
+	})
+	_ = blocked.Close()
+
+	if _, stillThere := clients.Load("blocked"); stillThere {
+		t.Fatal("blocked client was not dropped after write timeout")
+	}
+	if !strings.Contains(out, "Send error [blocked]:") {
+		t.Fatalf("output = %q, want send error", out)
+	}
+}
+
+func TestInteractiveClientDialFailureExitCode(t *testing.T) {
+	port := freeTCPPort(t)
+	var code int
+	out := captureStdoutWithArgs(t, []string{"coe", "-c", "127.0.0.1", port, "--no-color"}, func() {
+		code = runClientWithExitCode()
+	})
+	if code != exitIO {
+		t.Fatalf("exit code = %d, want %d; output=%q", code, exitIO, out)
+	}
+	if !strings.Contains(out, "Connection error:") {
+		t.Fatalf("output = %q, want connection error", out)
+	}
+}
+
+func TestRunServerBindFailureExitCode(t *testing.T) {
+	var code int
+	out := captureStdoutWithArgs(t, []string{"coe", "-s", "not-a-port", "--no-color"}, func() {
+		code = runServer()
+	})
+	if code != exitIO {
+		t.Fatalf("exit code = %d, want %d; output=%q", code, exitIO, out)
+	}
+	if !strings.Contains(out, "Server startup error:") {
+		t.Fatalf("output = %q, want bind error", out)
+	}
+}
+
+func TestRunServerRejectsExtraClients(t *testing.T) {
+	port := freeTCPPort(t)
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer stdinR.Close()
+
+	driverDone := make(chan struct{})
+	go func() {
+		defer close(driverDone)
+		defer stdinW.Close()
+
+		first := waitForTCP(t, "127.0.0.1:"+port)
+		defer first.Close()
+
+		second, err := net.Dial("tcp", "127.0.0.1:"+port)
+		if err != nil {
+			t.Errorf("second Dial() error: %v", err)
+			return
+		}
+		defer second.Close()
+		if err := second.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Errorf("SetReadDeadline() error: %v", err)
+			return
+		}
+		buf := make([]byte, 1)
+		_, err = second.Read(buf)
+		if err == nil {
+			t.Error("second client stayed connected, want rejection")
+			return
+		}
+
+		if _, err := fmt.Fprintf(stdinW, "#quit\n"); err != nil {
+			t.Errorf("write #quit error: %v", err)
+		}
+	}()
+
+	out := captureStdoutWithArgsAndStdin(t, []string{"coe", "-s", port, "--no-color", "--max-clients", "1"}, stdinR, func() {
+		_ = runServer()
+	})
+	<-driverDone
+
+	if !strings.Contains(out, "max clients (1) reached") {
+		t.Fatalf("server output missing rejection: %q", out)
+	}
+}
+
+func TestRunServerSendPreservesRepeatedSpaces(t *testing.T) {
+	port := freeTCPPort(t)
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer stdinR.Close()
+
+	driverDone := make(chan struct{})
+	go func() {
+		defer close(driverDone)
+		defer stdinW.Close()
+
+		conn := waitForTCP(t, "127.0.0.1:"+port)
+		defer conn.Close()
+
+		if _, err := conn.Write([]byte("ping\n")); err != nil {
+			t.Errorf("write ping error: %v", err)
+			return
+		}
+		readUntilContains(t, conn, "ping\n")
+
+		if _, err := fmt.Fprintf(stdinW, "#send %s A  B\n", conn.LocalAddr().String()); err != nil {
+			t.Errorf("write #send error: %v", err)
+			return
+		}
+		if got := readUntilContains(t, conn, "A  B\n"); !strings.Contains(got, "A  B\n") {
+			t.Errorf("send response = %q, want preserved spaces", got)
+			return
+		}
+		if _, err := fmt.Fprintf(stdinW, "#broadcast C  D\n"); err != nil {
+			t.Errorf("write #broadcast error: %v", err)
+			return
+		}
+		if got := readUntilContains(t, conn, "C  D\n"); !strings.Contains(got, "C  D\n") {
+			t.Errorf("broadcast response = %q, want preserved spaces", got)
+			return
+		}
+		if _, err := fmt.Fprintf(stdinW, "#quit\n"); err != nil {
+			t.Errorf("write #quit error: %v", err)
+		}
+	}()
+
+	out := captureStdoutWithArgsAndStdin(t, []string{"coe", "-s", port, "LF", "--no-color"}, stdinR, func() {
+		_ = runServer()
+	})
+	<-driverDone
+
+	if !strings.Contains(out, "Sent: A  B") {
+		t.Fatalf("server output missing spaced send: %q", out)
+	}
+}
+
+func TestInteractiveClientExitsOnPeerDisconnect(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+
+	addr := listener.Addr().(*net.TCPAddr)
+	done := make(chan struct{})
+	var code int
+	go func() {
+		defer close(done)
+		captureStdoutWithArgsAndStdin(
+			t,
+			[]string{"coe", "-c", addr.IP.String(), strconv.Itoa(addr.Port), "--no-color"},
+			stdinR,
+			func() { code = runClientWithExitCode() },
+		)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interactive client did not exit after peer disconnect")
+	}
+	<-serverDone
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
 }
