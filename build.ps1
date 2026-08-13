@@ -1,7 +1,7 @@
 # wingetパッケージ用ビルドスクリプト
 $ErrorActionPreference = "Stop"
 $appname = "coe"
-$version = "0.1.8"
+$version = "0.1.9"
 
 function Invoke-CoeBuild {
     param(

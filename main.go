@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	version             = "0.1.8"
+	version             = "0.1.9"
 	defaultBufferSize   = 1024
 	defaultMaxFrameSize = 1024 * 1024
 	defaultMaxClients   = 64
