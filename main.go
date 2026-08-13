@@ -165,19 +165,19 @@ func writeConn(conn net.Conn, data []byte, writeTimeout time.Duration) error {
 	return err
 }
 
-// splitHead splits on the first space. Leading whitespace is skipped before the
-// head token; everything after that first space is returned unchanged so that
-// message payloads can keep repeated, leading, and trailing spaces.
+// splitHead splits on the first space or tab. Leading whitespace is skipped
+// before the head token; everything after that single separator is returned
+// unchanged so that message payloads can keep repeated, leading, and trailing spaces.
 func splitHead(s string) (head, rest string) {
 	s = strings.TrimLeft(s, " \t")
 	if s == "" {
 		return "", ""
 	}
-	head, rest, found := strings.Cut(s, " ")
-	if !found {
+	i := strings.IndexAny(s, " \t")
+	if i < 0 {
 		return s, ""
 	}
-	return head, rest
+	return s[:i], s[i+1:]
 }
 
 func stdinIsTerminal() bool {
@@ -1155,7 +1155,7 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 		}
 		if err := conn.SetReadDeadline(readDeadline); err != nil {
 			fmt.Fprintln(logWriter, "Receive error:", err)
-			break
+			return exitIO
 		}
 
 		n, err := conn.Read(buffer)
@@ -1186,6 +1186,8 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 		}
 		if err != io.EOF {
 			fmt.Fprintln(logWriter, "Receive error:", err)
+			flushIncomplete()
+			return exitIO
 		}
 		flushIncomplete()
 		break
@@ -1222,9 +1224,10 @@ func runInteractiveClient(cfg clientConfig) int {
 	}()
 
 	var outputMutex sync.Mutex
-	recvDone := make(chan struct{})
+	recvDone := make(chan error, 1)
 	go func() {
-		defer close(recvDone)
+		var result error
+		defer func() { recvDone <- result }()
 		buffer := make([]byte, cfg.bufferSize)
 		var messageBuffer bytes.Buffer
 		var pendingSkipLF bool
@@ -1271,6 +1274,7 @@ func runInteractiveClient(cfg clientConfig) int {
 					clearInputLine()
 					fmt.Println("Receive error:", frameErr)
 					outputMutex.Unlock()
+					result = frameErr
 					return
 				}
 			}
@@ -1289,14 +1293,18 @@ func runInteractiveClient(cfg clientConfig) int {
 				clearInputLine()
 				fmt.Println("Receive error:", err)
 				outputMutex.Unlock()
+				if !errors.Is(err, io.EOF) {
+					result = err
+				}
 				return
 			}
 		}
 	}()
 
-	sendDone := make(chan struct{})
+	sendDone := make(chan error, 1)
 	go func() {
-		defer close(sendDone)
+		var result error
+		defer func() { sendDone <- result }()
 		scanner := bufio.NewScanner(os.Stdin)
 		scanner.Buffer(make([]byte, 1024), 1024*1024)
 		printPrompt("Send> ")
@@ -1314,6 +1322,7 @@ func runInteractiveClient(cfg clientConfig) int {
 			message := []byte(processedText + string(cfg.sendTerminatorBytes))
 			if err := writeConn(conn, message, cfg.writeTimeout); err != nil {
 				fmt.Println("Send error:", err)
+				result = err
 				return
 			}
 
@@ -1324,19 +1333,24 @@ func runInteractiveClient(cfg clientConfig) int {
 		}
 		if err := scanner.Err(); err != nil && !clientClosing.Load() {
 			fmt.Println("Input error:", err)
+			result = err
 		}
 	}()
 
+	var recvErr, sendErr error
 	select {
-	case <-recvDone:
+	case recvErr = <-recvDone:
 		clientClosing.Store(true)
 		conn.Close()
 		_ = os.Stdin.Close()
-		<-sendDone
-	case <-sendDone:
+		sendErr = <-sendDone
+	case sendErr = <-sendDone:
 		clientClosing.Store(true)
 		conn.Close()
-		<-recvDone
+		recvErr = <-recvDone
+	}
+	if recvErr != nil || sendErr != nil {
+		return exitIO
 	}
 	return exitOK
 }

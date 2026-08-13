@@ -30,7 +30,7 @@ if (!(Test-Path $releaseDir)) {
     $outputFile = "$buildDir/$appname.exe"
 
     Write-Host "Building for $target..." -ForegroundColor Green
-    
+
     # ビルドディレクトリを作成
     if (Test-Path $buildDir) {
         Remove-Item $buildDir -Recurse -Force
@@ -45,10 +45,10 @@ if (!(Test-Path $releaseDir)) {
 
     # ZIP化
     $zipPath = "$releaseDir/$appname" + "_$version" + "_$target.zip"
-    if (Test-Path $zipPath) { 
-        Remove-Item $zipPath -Force 
+    if (Test-Path $zipPath) {
+        Remove-Item $zipPath -Force
     }
-    
+
     Write-Host "Creating ZIP: $zipPath" -ForegroundColor Yellow
     Compress-Archive -Path (Get-ChildItem -Path $buildDir) -DestinationPath $zipPath
 
@@ -66,7 +66,7 @@ if (!(Test-Path $releaseDir)) {
     $outputFile = "$buildDir/$appname"
 
     Write-Host "Building for $target..." -ForegroundColor Green
-    
+
     # ビルドディレクトリを作成
     if (Test-Path $buildDir) {
         Remove-Item $buildDir -Recurse -Force
@@ -78,10 +78,10 @@ if (!(Test-Path $releaseDir)) {
 
     # ZIP化
     $zipPath = "$releaseDir/$appname" + "_$version" + "_$target.zip"
-    if (Test-Path $zipPath) { 
-        Remove-Item $zipPath -Force 
+    if (Test-Path $zipPath) {
+        Remove-Item $zipPath -Force
     }
-    
+
     Write-Host "Creating ZIP: $zipPath" -ForegroundColor Yellow
     Compress-Archive -Path (Get-ChildItem -Path $buildDir) -DestinationPath $zipPath
 
@@ -99,7 +99,7 @@ if (!(Test-Path $releaseDir)) {
     $outputFile = "$buildDir/$appname"
 
     Write-Host "Building for $target..." -ForegroundColor Green
-    
+
     # ビルドディレクトリを作成
     if (Test-Path $buildDir) {
         Remove-Item $buildDir -Recurse -Force
@@ -111,10 +111,10 @@ if (!(Test-Path $releaseDir)) {
 
     # ZIP化
     $zipPath = "$releaseDir/$appname" + "_$version" + "_$target.zip"
-    if (Test-Path $zipPath) { 
-        Remove-Item $zipPath -Force 
+    if (Test-Path $zipPath) {
+        Remove-Item $zipPath -Force
     }
-    
+
     Write-Host "Creating ZIP: $zipPath" -ForegroundColor Yellow
     Compress-Archive -Path (Get-ChildItem -Path $buildDir) -DestinationPath $zipPath
 

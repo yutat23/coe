@@ -1326,6 +1326,8 @@ func TestSplitHead(t *testing.T) {
 	}{
 		{"#send addr A  B", "#send", "addr A  B"},
 		{"  #broadcast  hello", "#broadcast", " hello"},
+		{"#send\t127.0.0.1:1234\thello", "#send", "127.0.0.1:1234\thello"},
+		{"#broadcast\thello", "#broadcast", "hello"},
 		{"#list", "#list", ""},
 		{"   ", "", ""},
 		{"#send addr", "#send", "addr"},
@@ -1340,6 +1342,10 @@ func TestSplitHead(t *testing.T) {
 	addr, message := splitHead("addr A  B")
 	if addr != "addr" || message != "A  B" {
 		t.Fatalf("send payload split = %q, %q; want addr, %q", addr, message, "A  B")
+	}
+	addr, message = splitHead("127.0.0.1:1234\thello")
+	if addr != "127.0.0.1:1234" || message != "hello" {
+		t.Fatalf("tab send payload split = %q, %q; want addr and hello", addr, message)
 	}
 }
 
@@ -1686,5 +1692,256 @@ func TestInteractiveClientExitsOnPeerDisconnect(t *testing.T) {
 	<-serverDone
 	if code != exitOK {
 		t.Fatalf("exit code = %d, want 0", code)
+	}
+}
+
+func TestInteractiveClientOversizedFrameExitCode(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte("hello\n")); err != nil {
+			t.Errorf("write oversized frame error: %v", err)
+			return
+		}
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf)
+	}()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+
+	addr := listener.Addr().(*net.TCPAddr)
+	done := make(chan struct{})
+	var code int
+	go func() {
+		defer close(done)
+		captureStdoutWithArgsAndStdin(
+			t,
+			[]string{"coe", "-c", addr.IP.String(), strconv.Itoa(addr.Port), "--no-color", "--max-frame-size", "4"},
+			stdinR,
+			func() { code = runClientWithExitCode() },
+		)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interactive client did not exit after oversized frame")
+	}
+	<-serverDone
+	if code != exitIO {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunOneShotClientReceiveResetReturnsOne(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Errorf("ReadString() error: %v", err)
+			_ = conn.Close()
+			return
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	}()
+
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	var code int
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", "127.0.0.1", port, "-m", "PING", "--wait", "1s", "--quiet", "--no-color"}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	<-serverDone
+
+	if code != exitIO {
+		t.Fatalf("exit code = %d, want 1; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if strings.Contains(stderr, "No response received") {
+		t.Fatalf("stderr = %q, want I/O error rather than wait timeout", stderr)
+	}
+}
+
+func TestRunOneShotClientResetAfterFrameReturnsOne(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Errorf("ReadString() error: %v", err)
+			_ = conn.Close()
+			return
+		}
+		if _, err := conn.Write([]byte("one\n")); err != nil {
+			t.Errorf("response write error: %v", err)
+			_ = conn.Close()
+			return
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	}()
+
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	var code int
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", "127.0.0.1", port, "-m", "PING", "--wait", "1s", "--quiet", "--no-color"}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	<-serverDone
+
+	if code != exitIO {
+		t.Fatalf("exit code = %d, want 1; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "one\n" {
+		t.Fatalf("quiet stdout = %q, want the frame received before reset", stdout)
+	}
+	if strings.Contains(stderr, "No response received") {
+		t.Fatalf("stderr = %q, want I/O error rather than wait timeout", stderr)
+	}
+}
+
+func TestRunOneShotClientEOFAfterFrameReturnsZero(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept() error: %v", err)
+			return
+		}
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Errorf("ReadString() error: %v", err)
+			_ = conn.Close()
+			return
+		}
+		if _, err := conn.Write([]byte("one\n")); err != nil {
+			t.Errorf("response write error: %v", err)
+		}
+		_ = conn.Close()
+	}()
+
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	var code int
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", "127.0.0.1", port, "-m", "PING", "--wait", "1s", "--quiet", "--no-color"}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	<-serverDone
+
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want 0; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "one\n" {
+		t.Fatalf("quiet stdout = %q, want the frame received before EOF", stdout)
+	}
+}
+
+func TestRunServerSendAcceptsTabSeparators(t *testing.T) {
+	port := freeTCPPort(t)
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer stdinR.Close()
+
+	driverDone := make(chan struct{})
+	go func() {
+		defer close(driverDone)
+		defer stdinW.Close()
+
+		conn := waitForTCP(t, "127.0.0.1:"+port)
+		defer conn.Close()
+
+		if _, err := conn.Write([]byte("ping\n")); err != nil {
+			t.Errorf("write ping error: %v", err)
+			return
+		}
+		readUntilContains(t, conn, "ping\n")
+
+		if _, err := fmt.Fprintf(stdinW, "#send\t%s\thello\n", conn.LocalAddr().String()); err != nil {
+			t.Errorf("write tab #send error: %v", err)
+			return
+		}
+		if got := readUntilContains(t, conn, "hello\n"); !strings.Contains(got, "hello\n") {
+			t.Errorf("send response = %q, want hello", got)
+			return
+		}
+		if _, err := fmt.Fprintf(stdinW, "#broadcast\tworld\n"); err != nil {
+			t.Errorf("write tab #broadcast error: %v", err)
+			return
+		}
+		if got := readUntilContains(t, conn, "world\n"); !strings.Contains(got, "world\n") {
+			t.Errorf("broadcast response = %q, want world", got)
+			return
+		}
+		if _, err := fmt.Fprintf(stdinW, "#quit\n"); err != nil {
+			t.Errorf("write #quit error: %v", err)
+		}
+	}()
+
+	out := captureStdoutWithArgsAndStdin(t, []string{"coe", "-s", port, "LF", "--no-color"}, stdinR, func() {
+		_ = runServer()
+	})
+	<-driverDone
+
+	if !strings.Contains(out, "Sent: hello") {
+		t.Fatalf("server output missing tab send: %q", out)
 	}
 }

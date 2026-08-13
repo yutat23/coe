@@ -49,4 +49,4 @@ if (-not $alreadyOnPath) {
 }
 
 Write-Host "Installation completed successfully!" -ForegroundColor Green
-Write-Host "You can now use 'coe' command from anywhere." -ForegroundColor Yellow 
+Write-Host "You can now use 'coe' command from anywhere." -ForegroundColor Yellow

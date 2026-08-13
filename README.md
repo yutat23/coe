@@ -96,9 +96,9 @@ coe -c 127.0.0.1 8080 -m "STATUS\\r" --wait 1s --quiet
 Exit status:
 
 - `0`: success, including `--help` and no-argument usage
-- `1`: connection or bind/listen failure, or a receive-side I/O error such as an oversized frame
+- `1`: connection or bind/listen failure, receive-side I/O error (including oversized frame), or interactive send/input failure
 - `2`: usage/argument error; in one-shot mode, also a send failure
-- `3`: `--wait` elapsed with no response frame
+- `3`: `--wait` elapsed with no response frame. Unexpected receive I/O errors during `--wait` return `1`, even if some frames already arrived. A clean EOF after receiving frames is still `0`.
 
 ## Message Processing
 
