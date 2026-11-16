@@ -741,17 +741,25 @@ func acceptClients(listener net.Listener, cfg serverConfig, clients *sync.Map, c
 		clientCount.Add(1)
 
 		go func() {
-			handleClient(conn, cfg.recvTerminatorBytes, cfg.sendTerminatorBytes, cfg.echoEnabled, cfg.bufferSize, cfg.flushTimeout, cfg.maxFrameSize, cfg.writeTimeout)
+			handleClient(conn, cfg)
 			clients.Delete(clientAddr)
 			clientCount.Add(-1)
 		}()
 	}
 }
 
-func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte, echoEnabled bool, bufferSize int, flushTimeout time.Duration, maxFrameSize int, writeTimeout time.Duration) {
+func handleClient(conn net.Conn, cfg serverConfig) {
 	clientAddr := conn.RemoteAddr().String()
 	defer conn.Close()
 	defer func() { sink().clientDisconnected(clientAddr) }()
+
+	recvTerminatorBytes := cfg.recvTerminatorBytes
+	sendTerminatorBytes := cfg.sendTerminatorBytes
+	echoEnabled := cfg.echoEnabled
+	bufferSize := cfg.bufferSize
+	flushTimeout := cfg.flushTimeout
+	maxFrameSize := cfg.maxFrameSize
+	writeTimeout := cfg.writeTimeout
 
 	buffer := make([]byte, bufferSize)
 	var messageBuffer bytes.Buffer
@@ -1109,10 +1117,6 @@ func parseClientConfig() (clientConfig, error) {
 		return clientConfig{}, fmt.Errorf("Error (-rt / --rx-term): %w", err)
 	}
 	return cfg, nil
-}
-
-func runClient() {
-	_ = runClientWithExitCode()
 }
 
 func runClientWithExitCode() int {

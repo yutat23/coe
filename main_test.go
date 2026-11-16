@@ -1182,7 +1182,7 @@ func TestRunClientConnectsSendsReceivesAndExitsOnStdinEOF(t *testing.T) {
 		t,
 		[]string{"coe", "-c", addr.IP.String(), strconv.Itoa(addr.Port), "LF", "--buffer-size", "3", "--no-color"},
 		stdinR,
-		runClient,
+		func() { runClientWithExitCode() },
 	)
 	<-serverDone
 	<-stdinDone
@@ -1232,7 +1232,7 @@ func TestHandleClientEchoesCompleteFrames(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\r', '\n'}, true, 2, 0, 0, 0)
+		handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\r', '\n'}, echoEnabled: true, bufferSize: 2})
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -1255,7 +1255,7 @@ func TestHandleClientDoesNotEchoWhenDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 8, 0, 0, 0)
+		handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: false, bufferSize: 8})
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -1298,7 +1298,7 @@ func TestHandleClientProcessesDataDeliveredWithEOF(t *testing.T) {
 	conn := &dataThenEOFConn{data: []byte("hello\nworld")}
 
 	out := captureStdout(t, func() {
-		handleClient(conn, []byte{'\n'}, []byte{'\n'}, true, 32, 0, 0, 0)
+		handleClient(conn, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: true, bufferSize: 32})
 	})
 
 	if got, want := conn.writes.String(), "hello\n"; got != want {
@@ -1318,7 +1318,7 @@ func TestHandleClientReceivesCRAndDropsFollowingLF(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\r'}, []byte{'\n'}, true, 32, 0, 0, 0)
+		handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\r'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: true, bufferSize: 32})
 	}()
 
 	if _, err := client.Write([]byte("hello\r\nworld\r")); err != nil {
@@ -1470,7 +1470,7 @@ func TestHandleClientDropsOversizedFrame(t *testing.T) {
 	go func() {
 		defer close(done)
 		out = captureStdout(t, func() {
-			handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 32, 0, 4, 0)
+			handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: false, bufferSize: 32, maxFrameSize: 4})
 		})
 	}()
 
