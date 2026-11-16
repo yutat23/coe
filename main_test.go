@@ -581,6 +581,7 @@ func TestShowLogoAndUsageOutput(t *testing.T) {
 		"OPTIONS",
 		"ESCAPE SEQUENCES",
 		"Server mode commands:",
+		"--tui",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q: %q", want, out)
@@ -703,6 +704,16 @@ func TestRunClientArgumentValidation(t *testing.T) {
 			name: "unknown option",
 			args: []string{"coe", "-c", "127.0.0.1", "1234", "--bad"},
 			want: "Error: Unknown option --bad",
+		},
+		{
+			name: "tui requires a terminal",
+			args: []string{"coe", "-c", "127.0.0.1", "1234", "--tui"},
+			want: "Error: --tui requires a terminal",
+		},
+		{
+			name: "tui cannot be used with one-shot message",
+			args: []string{"coe", "-c", "127.0.0.1", "1234", "-m", "hi", "--tui"},
+			want: "Error: --tui cannot be used with -m",
 		},
 		{
 			name: "missing max frame size",
@@ -978,6 +989,11 @@ func TestRunServerArgumentValidation(t *testing.T) {
 			name: "unknown option",
 			args: []string{"coe", "-s", "1234", "--bad"},
 			want: "Error: Unknown option or terminator --bad",
+		},
+		{
+			name: "tui requires a terminal",
+			args: []string{"coe", "-s", "1234", "--tui"},
+			want: "Error: --tui requires a terminal",
 		},
 		{
 			name: "missing max frame size",

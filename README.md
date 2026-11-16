@@ -25,6 +25,7 @@ The name comes from *koe* (声), Japanese for "voice" — the tool is there to l
 - Escape sequences in sent messages: `\r`, `\n`, `\t`, `\\`, `\xHH`
 - Optional incomplete-frame flushing with `--flush-timeout`
 - One-shot client sends with `-m` / `--message`
+- Optional interactive TUI with `--tui` (client list, frame log, hex dump)
 - Time-based response waiting with `--wait` and script-friendly output with `--quiet`
 - Receive frame size limit (`--max-frame-size`) and server connection limit (`--max-clients`)
 - Per-write socket deadline (`--write-timeout`) so a stalled peer cannot freeze the server
@@ -67,6 +68,7 @@ coe -c <IP> <port> [terminator] [options]
 - `--color`: enable color output, default on
 - `--no-color`: disable color output
 - `--no-echo`: disable server echo-back, server mode only
+- `--tui`: interactive TUI for server and client sessions. Requires a terminal. Incompatible with `-m`.
 
 ## Server Commands
 
@@ -85,6 +87,7 @@ coe -s 8080 CR --no-echo
 coe -s 8080 -tt CR -rt CRLF
 coe -s 8080 --flush-timeout 100ms
 coe -s 8080 --max-frame-size 4096 --max-clients 8 --write-timeout 2s
+coe -s 8080 --tui
 
 coe -c 127.0.0.1 8080
 coe -c ::1 8080
@@ -92,6 +95,7 @@ coe -c 127.0.0.1 8080 LF
 coe -c 127.0.0.1 8080 -tt CR -rt CRLF
 coe -c 192.168.1.100 8080 CR --buffer-size 512 --no-color
 coe -c 127.0.0.1 8080 -m "STATUS\\r" --wait 1s --quiet
+coe -c 127.0.0.1 8080 --tui
 ```
 
 Exit status:
@@ -116,6 +120,16 @@ Logged payloads use the same notation for control bytes, so a stray CR shows up 
 - Go 1.24.4 or later
 - Network connectivity for client/server communication
 
+## TUI
+
+`--tui` replaces the line prompt with a full-screen session. One-shot (`-m`) stays on the original CLI.
+
+Server layout: client list on the left, frames on the right, input at the bottom. `Tab` / `Shift+Tab` selects the target (`*` is broadcast, the default). `Enter` sends to the target. The target never changes on its own: if the selected client disconnects it becomes `(none)` and the typed line is kept until you pick another one. `#send`, `#broadcast`, `#list`, `#help`, and `#quit` still work. `F2` toggles a hex dump under each frame. `F1` or `#help` shows help.
+
+Client layout: conversation log plus input, with the same hex and history keys. When the peer closes the connection the log stays on screen; press `Ctrl+C` to exit, and the reason is printed after the screen is restored.
+
+Long frames wrap to the window width, and the hex dump uses 16, 8, or 4 bytes per row depending on the space available.
+
 ## Dependencies
 
-coe uses only the Go standard library.
+Interactive `--tui` uses Charm's Bubble Tea, Bubbles, and Lip Gloss. Line-oriented and one-shot modes keep the previous CLI behavior.
