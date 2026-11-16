@@ -1235,7 +1235,13 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 	}
 
 	if !received {
-		fmt.Fprintf(logWriter, "No response received within %s\n", cfg.wait)
+		discardOrphanLFAfterCR(&messageBuffer, cfg.recvTerminatorBytes)
+		if messageBuffer.Len() > 0 {
+			fmt.Fprintf(logWriter, "No response received within %s (%d bytes arrived without the %s terminator; use --flush-timeout to show them)\n",
+				cfg.wait, messageBuffer.Len(), strings.ToUpper(cfg.recvTerminatorName))
+		} else {
+			fmt.Fprintf(logWriter, "No response received within %s\n", cfg.wait)
+		}
 		return exitNoResponse
 	}
 	return exitOK
