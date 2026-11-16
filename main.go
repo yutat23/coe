@@ -1342,8 +1342,14 @@ func runInteractiveClient(cfg clientConfig) int {
 	case recvErr = <-recvDone:
 		clientClosing.Store(true)
 		conn.Close()
+		// Closing a pipe unblocks the scanner, but a read on a terminal stays
+		// blocked until the user presses Enter. Do not wait for it: the process
+		// exits right after this returns, which ends the input goroutine.
 		_ = os.Stdin.Close()
-		sendErr = <-sendDone
+		select {
+		case sendErr = <-sendDone:
+		case <-time.After(100 * time.Millisecond):
+		}
 	case sendErr = <-sendDone:
 		clientClosing.Store(true)
 		conn.Close()
