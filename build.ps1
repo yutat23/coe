@@ -9,7 +9,8 @@ function Invoke-CoeBuild {
         [string]$OutputFile
     )
 
-    go build -o $OutputFile -ldflags "-s -w" main.go
+    # Build the package, not main.go alone: the program spans several files.
+    go build -o $OutputFile -ldflags "-s -w" .
     if ($LASTEXITCODE -ne 0) {
         throw "go build failed: $OutputFile (exit $LASTEXITCODE)"
     }
