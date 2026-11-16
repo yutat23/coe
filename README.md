@@ -109,6 +109,8 @@ For devices or protocols that do not send a terminator, use `--flush-timeout 100
 
 Sent messages are processed for escape sequences before the configured send terminator is appended. For example, `Hello\r\nWorld` sends `Hello` followed by CRLF and `World`.
 
+Logged payloads use the same notation for control bytes, so a stray CR shows up as `hello\r` and a peer's escape sequences appear as `\x1B[2J` instead of acting on your terminal. The `HEX:` column always shows the exact bytes. `--quiet` one-shot output on stdout stays raw for scripts.
+
 ## Requirements
 
 - Go 1.24.4 or later

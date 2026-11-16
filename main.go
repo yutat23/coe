@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -185,6 +186,44 @@ func stdinIsTerminal() bool {
 	return err == nil && (info.Mode()&os.ModeCharDevice) != 0
 }
 
+// displayText makes a payload safe to print on a terminal. Control bytes, C1
+// controls, and invalid UTF-8 are written with the same escape syntax that
+// outgoing messages accept (\r, \n, \t, \xHH), so a peer cannot move the
+// cursor, retitle the window, or hide the rest of a log line. A backslash in the
+// payload is left unchanged.
+func displayText(s string) string {
+	needsEscape := false
+	for _, r := range s {
+		if r < 0x20 || r == 0x7F || (r >= 0x80 && r <= 0x9F) || r == utf8.RuneError {
+			needsEscape = true
+			break
+		}
+	}
+	if !needsEscape {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7F || (r >= 0x80 && r <= 0x9F) || (r == utf8.RuneError && size == 1):
+			for _, c := range []byte(s[i : i+size]) {
+				fmt.Fprintf(&b, `\x%02X`, c)
+			}
+		default:
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
+}
+
 func clearInputLine() {
 	if terminalControlEnabled {
 		fmt.Print("\r\033[K")
@@ -202,6 +241,7 @@ func printPrompt(prompt string) {
 func logServerData(addr, verb, verbColor, message string, raw []byte) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 	hexData := fmt.Sprintf("%x", raw)
+	message = displayText(message)
 	if colorEnabled {
 		fmt.Printf("%s[%s]%s %s%s%s | %s%s:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 			colorBlue, addr, colorReset,
@@ -220,6 +260,7 @@ func logServerData(addr, verb, verbColor, message string, raw []byte) {
 func logClientDataTo(w io.Writer, tag, tagColor, message string, raw []byte) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 	hexData := fmt.Sprintf("%x", raw)
+	message = displayText(message)
 	if colorEnabled {
 		fmt.Fprintf(w, "%s[%s]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
 			tagColor, tag, colorReset,

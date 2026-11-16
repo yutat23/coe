@@ -1945,3 +1945,35 @@ func TestRunServerSendAcceptsTabSeparators(t *testing.T) {
 		t.Fatalf("server output missing tab send: %q", out)
 	}
 }
+
+func TestDisplayTextEscapesControls(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"plain text", "plain text"},
+		{"A\r\nB\x1bC", `A\r\nB\x1BC`},
+		{"tab\there", `tab\there`},
+		{"\x1b]0;title\x07", `\x1B]0;title\x07`},
+		{"c1\u009bx", `c1\xC2\x9Bx`},
+		{"bad\xffutf8", `bad\xFFutf8`},
+		{"日本語", "日本語"},
+		{`back\slash`, `back\slash`},
+	}
+	for _, tt := range tests {
+		if got := displayText(tt.in); got != tt.want {
+			t.Errorf("displayText(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestLogLinesDoNotCarryRawControlBytes(t *testing.T) {
+	colorEnabled = false
+	out := captureStdout(t, func() {
+		logClientData("Recv", colorGreen, "hello\r", []byte("hello\r\n"))
+		logServerData("1.2.3.4:5", "Received", colorGreen, "\x1b[2Jx", []byte("\x1b[2Jx\n"))
+	})
+	if strings.ContainsAny(out, "\r\x1b") {
+		t.Fatalf("log output contains raw control bytes: %q", out)
+	}
+	if !strings.Contains(out, `hello\r (Bytes: 7`) || !strings.Contains(out, `\x1B[2Jx (Bytes: 6`) {
+		t.Fatalf("escaped payload missing: %q", out)
+	}
+}
