@@ -133,3 +133,7 @@ Long frames wrap to the window width, and the hex dump uses 16, 8, or 4 bytes pe
 ## Dependencies
 
 Interactive `--tui` uses Charm's Bubble Tea, Bubbles, and Lip Gloss. Line-oriented and one-shot modes keep the previous CLI behavior.
+
+## Releases
+
+`build.ps1` (PowerShell 7) builds Windows, Linux, and macOS archives into `release/`. The version comes from `version` in `main.go`. Archives are reproducible for a given commit, and the Linux and macOS binaries keep their execute permission when unzipped.
