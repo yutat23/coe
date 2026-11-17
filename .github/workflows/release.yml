@@ -1,0 +1,233 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Builds an existing tag again and attaches the binaries to its release
+  # (creating the release if needed). It does not submit to winget.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag, e.g. v0.1.10
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Tag matches main.go version
+        if: runner.os == 'Linux'
+        run: |
+          want="${TAG#v}"
+          got=$(sed -n 's/^var version = "\(.*\)"/\1/p' main.go)
+          if [ "$got" != "$want" ]; then
+            echo "main.go has version $got but the tag is $TAG"; exit 1
+          fi
+      - name: Test
+        run: go test ./...
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+          - goos: windows
+            goarch: "386"
+            ext: .exe
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          version="${TAG#v}"
+          name="coe-${GOOS}-${GOARCH}${{ matrix.ext }}"
+          go build -trimpath -ldflags "-s -w -X main.version=${version}" -o "${name}" .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coe-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: coe-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "${TAG#v}" \
+              --generate-notes
+          fi
+
+  # Requires repo secret HOMEBREW_TAP_TOKEN: a PAT with contents:write on yutat23/homebrew-tap.
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: actions/checkout@v7
+        with:
+          repository: yutat23/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Update formula
+        working-directory: homebrew-tap
+        run: |
+          version="${TAG#v}"
+          sha() { sha256sum "../dist/$1" | awk '{print $1}'; }
+          darwin_arm64=$(sha coe-darwin-arm64)
+          darwin_amd64=$(sha coe-darwin-amd64)
+          linux_arm64=$(sha coe-linux-arm64)
+          linux_amd64=$(sha coe-linux-amd64)
+          mkdir -p Formula
+          cat > Formula/coe.rb <<EOF
+          class Coe < Formula
+            desc "TCP socket tool for interactive server/client testing"
+            homepage "https://github.com/yutat23/coe"
+            version "${version}"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/yutat23/coe/releases/download/v${version}/coe-darwin-arm64"
+                sha256 "${darwin_arm64}"
+              end
+              on_intel do
+                url "https://github.com/yutat23/coe/releases/download/v${version}/coe-darwin-amd64"
+                sha256 "${darwin_amd64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/yutat23/coe/releases/download/v${version}/coe-linux-arm64"
+                sha256 "${linux_arm64}"
+              end
+              on_intel do
+                url "https://github.com/yutat23/coe/releases/download/v${version}/coe-linux-amd64"
+                sha256 "${linux_amd64}"
+              end
+            end
+
+            def install
+              os = OS.mac? ? "darwin" : "linux"
+              arch = Hardware::CPU.arm? ? "arm64" : "amd64"
+              binary = "coe-#{os}-#{arch}"
+              chmod "+x", binary
+              bin.install binary => "coe"
+            end
+
+            test do
+              assert_match "coe #{version}", shell_output("#{bin}/coe --version")
+            end
+          end
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/coe.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "coe ${version}"
+          git push
+
+  # Requires repo secret WINGET_CREATE_GITHUB_TOKEN: a PAT that can write to
+  # yutat23/winget-pkgs and submit a PR to microsoft/winget-pkgs.
+  # "wingetcreate update" needs yutat23.coe to exist in winget-pkgs already.
+  winget:
+    needs: release
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - name: Verify token
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+            throw "Repository secret WINGET_CREATE_GITHUB_TOKEN is not configured."
+          }
+      - name: Sync WinGet fork
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          gh api --method POST repos/yutat23/winget-pkgs/merge-upstream -f branch=master
+      - name: Submit WinGet update
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+
+          $version = $env:TAG -replace '^v', ''
+          $baseUrl = "https://github.com/yutat23/coe/releases/download/v${version}"
+          $releaseUrl = "https://github.com/yutat23/coe/releases/tag/v${version}"
+
+          & .\wingetcreate.exe update yutat23.coe `
+            --version $version `
+            --urls `
+              "${baseUrl}/coe-windows-amd64.exe|x64" `
+              "${baseUrl}/coe-windows-arm64.exe|arm64" `
+              "${baseUrl}/coe-windows-386.exe|x86" `
+            --release-notes-url $releaseUrl `
+            --submit `
+            --no-open
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "wingetcreate failed with exit code $LASTEXITCODE."
+          }

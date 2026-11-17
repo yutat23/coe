@@ -34,6 +34,16 @@ The name comes from *koe* (声), Japanese for "voice" — the tool is there to l
 
 ## Installation
 
+Homebrew (macOS, Linux):
+
+```bash
+brew install yutat23/tap/coe
+```
+
+Prebuilt binaries for Windows (x64, arm64, x86), Linux, and macOS are attached to each [release](https://github.com/yutat23/coe/releases).
+
+From source:
+
 ```bash
 git clone https://github.com/yutat23/coe.git
 cd coe
