@@ -141,6 +141,7 @@ jobs:
             desc "TCP socket tool for interactive server/client testing"
             homepage "https://github.com/yutat23/coe"
             version "${version}"
+            license "MIT"
 
             on_macos do
               on_arm do

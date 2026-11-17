@@ -179,3 +179,7 @@ Interactive `--tui` uses Charm's Bubble Tea, Bubbles, and Lip Gloss (v2). Line-o
 ## Releases
 
 `build.ps1` (PowerShell 7) builds Windows, Linux, and macOS archives into `release/`. The version comes from `version` in `main.go`. Archives are reproducible for a given commit, and the Linux and macOS binaries keep their execute permission when unzipped.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
