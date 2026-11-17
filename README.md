@@ -72,10 +72,10 @@ The server listens on every interface unless a host is given (`-s 127.0.0.1:8080
 - `-m <message>`, `--message <message>`: send one message and exit without starting the interactive prompt
 - `--wait <duration>`: with `-m`, receive frames for this duration after sending; omitted means fire-and-forget. With piped input (no `-m`), wait at most this long for replies after the input ends.
 - `--quiet`: with `-m`, write response payloads (one line per frame) to stdout and connection/log output to stderr
-- `--log <file>`: append frames and connection events to a file, without colors. Frames are logged in full.
+- `--log <file>`: append frames and connection events to a file, without colors. Frames are logged in full, also in the TUI.
 - `--bind <host>`: listen on one address only, server mode only. Cannot be combined with `-s host:port`.
 - `--color`: always color the output
-- `--no-color`: never color the output. Without either flag, output is colored only on a terminal and only when the `NO_COLOR` environment variable is unset or empty.
+- `--no-color`: never color the output. Without either flag, output is colored only on a terminal and only when the `NO_COLOR` environment variable is unset or empty. The flags apply to the TUI as well.
 - `--no-echo`: disable server echo-back, server mode only
 - `--tui`: interactive TUI for server and client sessions. Requires a terminal. Incompatible with `-m`.
 - `-v`, `--version`: print the version
@@ -132,7 +132,7 @@ coe -c 127.0.0.1 8080 --tui
 Exit status:
 
 - `0`: success, including `--help` and no-argument usage
-- `0` also when the server is stopped with Ctrl+C, SIGINT, or SIGTERM
+- `0` also when the server or TUI is stopped with Ctrl+C, SIGINT, or SIGTERM
 - `1`: connection or bind/listen failure (including a connect timeout), receive-side I/O error (including oversized frame), interactive send/input failure, or a log file that cannot be opened
 - `2`: usage/argument error, including an invalid port; in one-shot mode, also a send failure
 - `3`: `--wait` elapsed with no response frame. Unexpected receive I/O errors during `--wait` return `1`, even if some frames already arrived. A clean EOF after receiving frames is still `0`.
@@ -149,7 +149,7 @@ Logged payloads use the same notation for control bytes, so a stray CR shows up 
 
 ## Requirements
 
-- Go 1.24.4 or later
+- Go 1.26 or later to build (the TUI libraries require it)
 - Network connectivity for client/server communication
 
 ## TUI
@@ -160,11 +160,11 @@ Server layout: client list on the left, frames on the right, input at the bottom
 
 Client layout: conversation log plus input, with the same hex and history keys. When the peer closes the connection the log stays on screen; press `Ctrl+C` to exit, and the reason is printed after the screen is restored.
 
-Long frames wrap to the window width, and the hex dump uses 16, 8, or 4 bytes per row depending on the space available.
+Long frames wrap to the window width, and the hex dump uses 16, 8, or 4 bytes per row depending on the space available. The byte count always shows the full frame size, but the TUI keeps only the first 2 KiB of each frame for display, and the history is capped at 2000 entries and about 4 MiB of kept frame data, dropping the oldest entries first. Use `--log` to keep every frame in full. Toggling the hex dump or resizing never drops history. An empty line sends just the terminator to the selected client; with the `*` broadcast target it is ignored, so a stray Enter does not reach every client (`#broadcast` with no text sends an empty frame to all). Lines typed quickly are sent in order, and a multi-line paste is sent one line at a time; text after the last newline stays in the input line.
 
 ## Dependencies
 
-Interactive `--tui` uses Charm's Bubble Tea, Bubbles, and Lip Gloss. Line-oriented and one-shot modes keep the previous CLI behavior.
+Interactive `--tui` uses Charm's Bubble Tea, Bubbles, and Lip Gloss (v2). Line-oriented and one-shot modes keep the previous CLI behavior and do not query the terminal at startup.
 
 ## Releases
 

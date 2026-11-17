@@ -4,22 +4,32 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"image/color"
 	"io"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
 )
 
 const (
+	// The timeline is bounded both by entry count and by the bytes it keeps,
+	// so a peer sending large frames cannot grow it without limit. Each frame
+	// keeps only its first tuiFrameKeepBytes for display; --log records
+	// frames in full. The budget counts stored bytes, not rendered text, so
+	// toggling the hex dump or resizing never evicts history.
 	timelineCap        = 2000
+	timelineByteBudget = 4 << 20
+	tuiFrameKeepBytes  = 2048
+
 	tuiSinkBuffer      = 1024
 	noSelection        = -1
 	broadcastSelection = 0
@@ -39,7 +49,22 @@ type timelineItem struct {
 	incoming bool
 	message  string
 	raw      []byte
+	size     int  // full frame length; raw may hold only the start of it
+	clipped  bool // message or raw was shortened for display
 	text     string
+}
+
+// storedBytes is what the entry keeps in memory, for the timeline budget.
+func (item timelineItem) storedBytes() int {
+	return len(item.message) + len(item.raw) + len(item.text)
+}
+
+// frameSize is the length of the whole frame, which may exceed len(raw).
+func (item timelineItem) frameSize() int {
+	if item.size > 0 {
+		return item.size
+	}
+	return len(item.raw)
 }
 
 type frameMsg timelineItem
@@ -50,11 +75,25 @@ type peerClosedMsg struct{ err error }
 type sendFailedMsg struct{ err error }
 type idleTickMsg time.Time
 
-func runIO(fn func()) tea.Cmd {
-	return func() tea.Msg {
-		fn()
-		return nil
+// clipFrame copies at most tuiFrameKeepBytes of a frame for the timeline.
+// The copies matter: a substring or subslice would keep the whole frame
+// (up to --max-frame-size) alive.
+func clipFrame(message string, raw []byte) (string, []byte, int, bool) {
+	size := len(raw)
+	clipped := false
+	if len(raw) > tuiFrameKeepBytes {
+		raw = raw[:tuiFrameKeepBytes]
+		clipped = true
 	}
+	if len(message) > tuiFrameKeepBytes {
+		cut := tuiFrameKeepBytes
+		for cut > 0 && !utf8.RuneStart(message[cut]) {
+			cut--
+		}
+		message = message[:cut]
+		clipped = true
+	}
+	return strings.Clone(message), append([]byte(nil), raw...), size, clipped
 }
 
 // tuiSink forwards network events to the Bubble Tea program in the order they
@@ -63,7 +102,7 @@ func runIO(fn func()) tea.Cmd {
 // goroutines or reordering frames.
 //
 // send blocks while the queue is full, so it must never be called from
-// Update or View; call it from connection goroutines or tea.Cmd functions.
+// Update or View; call it from connection goroutines or the ioQueue.
 type tuiSink struct {
 	ch       chan tea.Msg
 	stop     chan struct{}
@@ -107,37 +146,102 @@ func (s *tuiSink) printf(format string, args ...any) {
 	if msg == "" {
 		return
 	}
+	logEventf("%s", msg)
 	s.send(systemMsg(msg))
 }
 
-func (s *tuiSink) serverFrame(addr, verb, _ string, message string, raw []byte) {
+func (s *tuiSink) frame(addr string, incoming bool, message string, raw []byte) {
+	msg, kept, size, clipped := clipFrame(message, raw)
 	s.send(frameMsg{
 		kind:     itemFrame,
 		time:     time.Now(),
 		addr:     addr,
-		incoming: verb == "Received",
-		message:  message,
-		raw:      append([]byte(nil), raw...),
+		incoming: incoming,
+		message:  msg,
+		raw:      kept,
+		size:     size,
+		clipped:  clipped,
 	})
 }
 
-func (s *tuiSink) clientFrame(tag, _ string, message string, raw []byte) {
-	s.send(frameMsg{
-		kind:     itemFrame,
-		time:     time.Now(),
-		addr:     tag,
-		incoming: tag == "Recv",
-		message:  message,
-		raw:      append([]byte(nil), raw...),
-	})
+func (s *tuiSink) serverFrame(addr, verb, verbColor string, message string, raw []byte) {
+	logLine(formatServerLine(logTimestamp(), addr, verb, verbColor, message, raw, false))
+	s.frame(addr, verb == "Received", message, raw)
+}
+
+func (s *tuiSink) clientFrame(tag, tagColor string, message string, raw []byte) {
+	logLine(formatClientLine(logTimestamp(), tag, tagColor, message, raw, false))
+	s.frame(tag, tag == "Recv", message, raw)
 }
 
 func (s *tuiSink) clientConnected(addr string) {
+	logEventf("Client connected: %s", addr)
 	s.send(clientConnectedMsg(addr))
 }
 
 func (s *tuiSink) clientDisconnected(addr string) {
+	logEventf("Client disconnected: %s", addr)
 	s.send(clientDisconnectedMsg(addr))
+}
+
+// ioQueue runs socket writes one at a time in the order the user submitted
+// them. Running each send as its own tea.Cmd would let the goroutines race,
+// so lines typed or pasted quickly could reach the peer out of order. push
+// never blocks, so Update may call it directly.
+type ioQueue struct {
+	mu       sync.Mutex
+	jobs     []func()
+	wake     chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func newIOQueue() *ioQueue {
+	q := &ioQueue{wake: make(chan struct{}, 1), stop: make(chan struct{})}
+	go q.run()
+	return q
+}
+
+func (q *ioQueue) push(fn func()) {
+	q.mu.Lock()
+	q.jobs = append(q.jobs, fn)
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *ioQueue) run() {
+	for {
+		select {
+		case <-q.wake:
+		case <-q.stop:
+			return
+		}
+		for {
+			select {
+			case <-q.stop:
+				return
+			default:
+			}
+			q.mu.Lock()
+			if len(q.jobs) == 0 {
+				q.mu.Unlock()
+				break
+			}
+			fn := q.jobs[0]
+			q.jobs[0] = nil
+			q.jobs = q.jobs[1:]
+			q.mu.Unlock()
+			fn()
+		}
+	}
+}
+
+// close drops queued jobs; a job already running finishes.
+func (q *ioQueue) close() {
+	q.stopOnce.Do(func() { close(q.stop) })
 }
 
 // hexBytesPerRow picks the widest hex dump row that fits in width columns.
@@ -234,7 +338,7 @@ func formatIdle(t time.Time) string {
 	return fmt.Sprintf("%dm", int(d.Minutes()))
 }
 
-func colorStyle(c lipgloss.Color) lipgloss.Style {
+func colorStyle(c color.Color) lipgloss.Style {
 	s := lipgloss.NewStyle()
 	if colorEnabled {
 		s = s.Foreground(c)
@@ -242,7 +346,7 @@ func colorStyle(c lipgloss.Color) lipgloss.Style {
 	return s
 }
 
-func borderColor(s lipgloss.Style, c lipgloss.Color) lipgloss.Style {
+func borderColor(s lipgloss.Style, c color.Color) lipgloss.Style {
 	if colorEnabled {
 		s = s.BorderForeground(c)
 	}
@@ -263,13 +367,16 @@ func tickIdle() tea.Cmd {
 	})
 }
 
-// wrapTo hard-wraps s to width columns (ANSI- and wide-character aware) so
-// long frames are not cut off by the viewport. width <= 0 disables wrapping.
+// wrapTo wraps s to width columns so long frames are not cut off at the
+// edge of the log. It is ANSI- and wide-character aware and carries an open
+// style over to the next line, so a colored span split by the wrap stays
+// colored and does not leak into the column next to the log. width <= 0
+// disables wrapping.
 func wrapTo(s string, width int) string {
 	if width <= 0 {
 		return s
 	}
-	return ansi.Hardwrap(s, width, true)
+	return lipgloss.Wrap(s, width, "")
 }
 
 func renderTimelineItem(item timelineItem, showHex bool, width int) string {
@@ -285,7 +392,10 @@ func renderTimelineItem(item timelineItem, showHex bool, width int) string {
 	}
 	addr := colorStyle(lipgloss.Color("12")).Render(item.addr)
 	msg := displayText(item.message)
-	count := colorStyle(lipgloss.Color("14")).Render(fmt.Sprintf("%dB", len(item.raw)))
+	if item.clipped {
+		msg += colorStyle(lipgloss.Color("8")).Render(fmt.Sprintf(" … (first %d bytes shown)", len(item.raw)))
+	}
+	count := colorStyle(lipgloss.Color("14")).Render(fmt.Sprintf("%dB", item.frameSize()))
 	line := wrapTo(fmt.Sprintf("%s  %s %s  %s  (%s)", ts, arrowStyle.Render(arrow), addr, msg, count), width)
 	if showHex && len(item.raw) > 0 {
 		dump := formatHexDumpN(item.raw, hexBytesPerRow(width))
@@ -295,37 +405,71 @@ func renderTimelineItem(item timelineItem, showHex bool, width int) string {
 }
 
 type tuiChrome struct {
-	width        int
-	height       int
-	input        textinput.Model
-	viewport     viewport.Model
-	ready        bool
-	showHex      bool
-	showHelp     bool
-	follow       bool
-	timeline     []timelineItem
-	rendered     []string // rendered[i] caches timeline[i] at contentWidth/showHex
-	contentWidth int
-	history      []string
-	historyIdx   int
+	width         int
+	height        int
+	input         textinput.Model
+	ready         bool
+	showHex       bool
+	showHelp      bool
+	timeline      []timelineItem
+	itemLines     []int    // itemLines[i] is how many entries of lines render timeline[i]
+	lines         []string // the rendered timeline at contentWidth/showHex, oldest first
+	storedBytes   int      // sum of timeline[i].storedBytes()
+	scroll        int      // lines scrolled up from the bottom; 0 follows new frames
+	contentWidth  int
+	contentHeight int
+	history       []string
+	historyIdx    int
+	io            *ioQueue
 }
 
 func newTUIChrome() tuiChrome {
 	return tuiChrome{
-		input:    newTUIInput(),
-		viewport: viewport.New(1, 1),
-		follow:   true,
+		input: newTUIInput(),
+		io:    newIOQueue(),
 	}
 }
 
+// appendItem renders only the new entry, so adding a frame costs the same
+// however long the timeline already is.
 func (c *tuiChrome) appendItem(item timelineItem) {
+	added := c.addRendered(item)
 	c.timeline = append(c.timeline, item)
-	c.rendered = append(c.rendered, renderTimelineItem(item, c.showHex, c.contentWidth))
-	if over := len(c.timeline) - timelineCap; over > 0 {
-		c.timeline = c.timeline[over:]
-		c.rendered = c.rendered[over:]
+	c.storedBytes += item.storedBytes()
+	if c.scroll > 0 {
+		c.scroll += added // keep the lines being read in place
 	}
-	c.syncViewport()
+	c.trimTimeline()
+}
+
+func (c *tuiChrome) addRendered(item timelineItem) int {
+	lines := strings.Split(renderTimelineItem(item, c.showHex, c.contentWidth), "\n")
+	c.lines = append(c.lines, lines...)
+	c.itemLines = append(c.itemLines, len(lines))
+	return len(lines)
+}
+
+// trimTimeline enforces the count and size budgets. When either is exceeded
+// it drops the oldest tenth at once, so that the copying is amortized over
+// many appends. The newest entry always stays.
+func (c *tuiChrome) trimTimeline() {
+	if len(c.timeline) <= timelineCap && c.storedBytes <= timelineByteBudget {
+		c.clampScroll()
+		return
+	}
+	keepCount, keepBytes := timelineCap*9/10, timelineByteBudget*9/10
+	drop, dropLines, bytes := 0, 0, c.storedBytes
+	for len(c.timeline)-drop > 1 && (len(c.timeline)-drop > keepCount || bytes > keepBytes) {
+		bytes -= c.timeline[drop].storedBytes()
+		dropLines += c.itemLines[drop]
+		drop++
+	}
+	// Copy instead of reslicing so the dropped entries can be collected.
+	c.timeline = append([]timelineItem(nil), c.timeline[drop:]...)
+	c.itemLines = append([]int(nil), c.itemLines[drop:]...)
+	c.lines = append([]string(nil), c.lines[dropLines:]...)
+	c.storedBytes = bytes
+	c.clampScroll()
 }
 
 func (c *tuiChrome) appendSystem(text string) {
@@ -336,30 +480,47 @@ func (c *tuiChrome) appendSystem(text string) {
 	})
 }
 
-// rerender rebuilds every cached line; needed only when the width or the hex
-// setting changes. Appends render just the new item.
+// rerender rebuilds every line; needed only when the width or the hex
+// setting changes. It keeps every entry and, as far as the new line count
+// allows, the scroll position.
 func (c *tuiChrome) rerender() {
-	c.rendered = c.rendered[:0]
+	c.lines, c.itemLines = nil, nil
 	for _, item := range c.timeline {
-		c.rendered = append(c.rendered, renderTimelineItem(item, c.showHex, c.contentWidth))
+		c.addRendered(item)
 	}
-	c.syncViewport()
+	c.clampScroll()
 }
 
-func (c *tuiChrome) syncViewport() {
-	if !c.ready {
-		return
+func (c *tuiChrome) pageSize() int {
+	return max(1, c.contentHeight-1)
+}
+
+func (c *tuiChrome) clampScroll() {
+	c.scroll = max(0, min(c.scroll, len(c.lines)-c.contentHeight))
+}
+
+// logView draws the visible part of the timeline: contentHeight lines, each
+// padded to contentWidth so the layout next to it stays aligned.
+func (c *tuiChrome) logView() string {
+	w, h := max(1, c.contentWidth), max(1, c.contentHeight)
+	visible := []string{colorStyle(lipgloss.Color("8")).Render("waiting for frames…")}
+	if len(c.lines) > 0 {
+		end := len(c.lines) - c.scroll
+		visible = c.lines[max(0, end-h):end]
 	}
-	stayBottom := c.follow || c.viewport.AtBottom()
-	if len(c.rendered) == 0 {
-		c.viewport.SetContent(colorStyle(lipgloss.Color("8")).Render("waiting for frames…"))
-	} else {
-		c.viewport.SetContent(strings.Join(c.rendered, "\n"))
+	out := make([]string, 0, h)
+	for _, l := range visible {
+		lw := ansi.StringWidth(l)
+		if lw > w {
+			l, lw = ansi.Truncate(l, w, ""), w
+		}
+		out = append(out, l+strings.Repeat(" ", w-lw))
 	}
-	if stayBottom {
-		c.viewport.GotoBottom()
-		c.follow = true
+	blank := strings.Repeat(" ", w)
+	for len(out) < h {
+		out = append(out, blank)
 	}
+	return strings.Join(out, "\n")
 }
 
 func (c *tuiChrome) recallHistory(delta int) {
@@ -403,7 +564,7 @@ func (c *tuiChrome) takeInput() string {
 // handleKey processes keys shared by the server and client TUIs. It reports
 // whether the key was consumed and whether the program should quit. Help is
 // on F1 only: "?" must stay typeable as the first character of a message.
-func (c *tuiChrome) handleKey(msg tea.KeyMsg) (handled, quit bool) {
+func (c *tuiChrome) handleKey(msg tea.KeyPressMsg) (handled, quit bool) {
 	key := msg.String()
 	if key == "ctrl+c" {
 		return true, true
@@ -422,13 +583,10 @@ func (c *tuiChrome) handleKey(msg tea.KeyMsg) (handled, quit bool) {
 		c.showHex = !c.showHex
 		c.rerender()
 	case "pgup":
-		c.follow = false
-		c.viewport.PageUp()
+		c.scroll += c.pageSize()
+		c.clampScroll()
 	case "pgdown":
-		c.viewport.PageDown()
-		if c.viewport.AtBottom() {
-			c.follow = true
-		}
+		c.scroll = max(0, c.scroll-c.pageSize())
 	case "up":
 		c.recallHistory(-1)
 	case "down":
@@ -446,6 +604,45 @@ func (c *tuiChrome) footer(extra string) string {
 	}
 	return colorStyle(lipgloss.Color("8")).Render(
 		fmt.Sprintf("F1 help  F2 %s  %sEnter send  Ctrl+C quit", hex, extra))
+}
+
+// tuiProgramOptions applies --color / --no-color to Bubble Tea, which
+// otherwise picks a color profile itself (and lets NO_COLOR win over
+// --color). The ASCII profile also strips the input line's built-in colors.
+func tuiProgramOptions() []tea.ProgramOption {
+	switch {
+	case !colorEnabled:
+		return []tea.ProgramOption{tea.WithColorProfile(colorprofile.ASCII)}
+	case colorMode == colorOn:
+		return []tea.ProgramOption{tea.WithColorProfile(colorprofile.ANSI256)}
+	}
+	return nil
+}
+
+// splitPaste splits pasted text into lines. Every line but the last ended
+// with a newline (LF, CR, or CRLF) and is to be sent; the last one is left in
+// the input line, as a terminal would.
+func splitPaste(text string) (complete []string, rest string) {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	parts := strings.Split(text, "\n")
+	return parts[:len(parts)-1], parts[len(parts)-1]
+}
+
+// fullScreen wraps rendered content in an alt-screen view.
+func fullScreen(content string) tea.View {
+	v := tea.NewView(content)
+	v.AltScreen = true
+	return v
+}
+
+// tuiExitError maps the result of Program.Run: Ctrl+C typed as a key quits
+// normally, and so do SIGINT and SIGTERM sent to the process.
+func tuiExitError(err error) error {
+	if errors.Is(err, tea.ErrInterrupted) {
+		return nil
+	}
+	return err
 }
 
 type clientEntry struct {
@@ -478,7 +675,7 @@ func runServerTUI(cfg serverConfig, listener net.Listener) int {
 		selected:    broadcastSelection,
 	}
 	s := newTUISink()
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tuiProgramOptions()...)
 	s.start(p)
 	setSink(s)
 
@@ -488,6 +685,7 @@ func runServerTUI(cfg serverConfig, listener net.Listener) int {
 	// Connection goroutines may outlive the program; keep them off the
 	// restored terminal. The process exits right after this returns.
 	setSink(quietSink{})
+	m.io.close()
 	s.close()
 	shuttingDown.Store(true)
 	listener.Close()
@@ -495,8 +693,8 @@ func runServerTUI(cfg serverConfig, listener net.Listener) int {
 		value.(net.Conn).Close()
 		return true
 	})
-	if err != nil {
-		fmt.Println("TUI error:", err)
+	if err := tuiExitError(err); err != nil {
+		errorf("TUI error: %v\n", err)
 		return exitIO
 	}
 	return exitOK
@@ -534,7 +732,7 @@ func (m serverTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendSystem("target cleared; Tab to pick another client")
 		}
 		return m, nil
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if handled, quit := m.handleKey(msg); handled {
 			if quit {
 				return m, tea.Quit
@@ -551,11 +749,13 @@ func (m serverTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			return m.submit()
 		}
-		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
-		return m, cmd
+	case tea.PasteMsg:
+		return m.paste(msg.Content)
 	}
-	return m, nil
+	// Keys and cursor blinks go to the input line.
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
 }
 
 func (m *serverTUI) applySize(w, h int) {
@@ -574,10 +774,9 @@ func (m *serverTUI) applySize(w, h int) {
 	}
 	m.listWidth = leftW
 	m.listHeight = bodyH
-	m.viewport.Width = max(1, rightW)
-	m.viewport.Height = max(1, bodyH)
-	m.input.Width = max(1, w-3)
-	m.contentWidth = m.viewport.Width
+	m.contentWidth = max(1, rightW)
+	m.contentHeight = max(1, bodyH)
+	m.input.SetWidth(max(1, w-3))
 	m.rerender()
 }
 
@@ -656,11 +855,31 @@ func (m *serverTUI) selectedAddr() (addr string, broadcast bool, ok bool) {
 	return m.entries[idx].addr, false, true
 }
 
+// paste submits each complete pasted line in order, like typing it and
+// pressing Enter. If a line cannot be sent (no target selected), it and the
+// rest stay in the input line.
+func (m serverTUI) paste(text string) (tea.Model, tea.Cmd) {
+	lines, rest := splitPaste(text)
+	for i, line := range lines {
+		m.input, _ = m.input.Update(tea.PasteMsg{Content: line})
+		next, cmd := m.submit()
+		m = next.(serverTUI)
+		if cmd != nil {
+			return m, cmd // #quit
+		}
+		if m.input.Value() != "" {
+			rest = strings.Join(append(lines[i+1:], rest), " ")
+			break
+		}
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(tea.PasteMsg{Content: rest})
+	return m, cmd
+}
+
 func (m serverTUI) submit() (tea.Model, tea.Cmd) {
 	line := m.input.Value()
-	if line == "" {
-		return m, nil
-	}
+	clients, term, timeout := m.clients, m.cfg.sendTerminatorBytes, m.cfg.writeTimeout
 	cmd, rest := splitHead(line)
 	if strings.HasPrefix(cmd, "#") {
 		m.takeInput()
@@ -671,17 +890,11 @@ func (m serverTUI) submit() (tea.Model, tea.Cmd) {
 				m.appendSystem("Usage: #send <clientAddr> <message>")
 				return m, nil
 			}
-			return m, runIO(func() {
-				sendToClient(m.clients, clientAddr, message, m.cfg.sendTerminatorBytes, m.cfg.writeTimeout)
-			})
+			m.io.push(func() { sendToClient(clients, clientAddr, message, term, timeout) })
 		case "#broadcast":
-			return m, runIO(func() {
-				broadcastToAll(m.clients, rest, m.cfg.sendTerminatorBytes, m.cfg.writeTimeout)
-			})
+			m.io.push(func() { broadcastToAll(clients, rest, term, timeout) })
 		case "#list":
-			return m, runIO(func() {
-				listClients(m.clients)
-			})
+			m.io.push(func() { listClients(clients) })
 		case "#help":
 			sub, _ := splitHead(rest)
 			if sub == "program" {
@@ -698,31 +911,40 @@ func (m serverTUI) submit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// An empty line is sent too: a bare terminator is a valid empty frame.
 	addr, broadcast, ok := m.selectedAddr()
 	if !ok {
 		// Keep the typed line so it can be sent after picking a target.
 		m.appendSystem("No client selected. Tab to pick a client, or #broadcast <message>")
 		return m, nil
 	}
+	if line == "" && broadcast {
+		// A stray Enter must not hit every client; #broadcast with no
+		// text still sends an empty frame to all of them.
+		m.appendSystem("Empty line not broadcast; use #broadcast to send an empty frame to every client")
+		return m, nil
+	}
 	m.takeInput()
 	if broadcast {
-		return m, runIO(func() {
-			broadcastToAll(m.clients, line, m.cfg.sendTerminatorBytes, m.cfg.writeTimeout)
-		})
+		m.io.push(func() { broadcastToAll(clients, line, term, timeout) })
+	} else {
+		m.io.push(func() { sendToClient(clients, addr, line, term, timeout) })
 	}
-	return m, runIO(func() {
-		sendToClient(m.clients, addr, line, m.cfg.sendTerminatorBytes, m.cfg.writeTimeout)
-	})
+	return m, nil
 }
 
-func (m serverTUI) View() string {
+func (m serverTUI) View() tea.View {
+	return fullScreen(m.render())
+}
+
+func (m serverTUI) render() string {
 	if !m.ready {
 		return "starting tui…"
 	}
 	if m.showHelp {
 		return renderHelp(m.width, m.height, serverTUIHelp)
 	}
-	body := lipgloss.JoinHorizontal(lipgloss.Top, m.clientPane(), m.viewport.View())
+	body := lipgloss.JoinHorizontal(lipgloss.Top, m.clientPane(), m.logView())
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.headerView(), body, m.targetView(), m.input.View(), m.footer("Tab client  "))
 }
@@ -743,8 +965,8 @@ func (m serverTUI) headerView() string {
 		write = "write " + m.cfg.writeTimeout.String()
 	}
 	title := colorStyle(lipgloss.Color("14")).Bold(true).Render("coe server")
-	return truncateLine(fmt.Sprintf("%s  :%s   TX:%s  RX:%s  %s  clients %s  %s",
-		title, m.cfg.port,
+	return truncateLine(fmt.Sprintf("%s  %s   TX:%s  RX:%s  %s  clients %s  %s",
+		title, net.JoinHostPort(m.cfg.host, m.cfg.port),
 		strings.ToUpper(m.cfg.sendTerminatorName),
 		strings.ToUpper(m.cfg.recvTerminatorName),
 		echo, clients, write), m.width)
@@ -826,8 +1048,9 @@ func (m serverTUI) clientPane() string {
 		lines = append(lines, dim.Render("  no clients"))
 	}
 
+	// In Lip Gloss v2 the width includes the border, so add its column.
 	style := lipgloss.NewStyle().
-		Width(width).
+		Width(width+1).
 		Height(m.listHeight).
 		MaxHeight(m.listHeight).
 		Border(lipgloss.NormalBorder(), false, true, false, false)
@@ -854,6 +1077,9 @@ Keys
 
 The target never changes by itself. If the selected
 client disconnects, the target becomes (none).
+An empty line sends just the terminator to the selected
+client (to all clients only with #broadcast).
+Pasted lines are sent one by one.
 
 Commands (same as the line UI)
   #send <clientAddr> <message>
@@ -863,7 +1089,9 @@ Commands (same as the line UI)
   #quit / #exit
 
 Escape sequences in messages: \r \n \t \\ \xHH
-Control bytes in frames are shown the same way.`
+Control bytes in frames are shown the same way.
+Frames longer than 2 KiB are shown in part;
+use --log to keep them in full.`
 
 type clientTUI struct {
 	tuiChrome
@@ -876,9 +1104,9 @@ type clientTUI struct {
 }
 
 func runClientTUI(cfg clientConfig) int {
-	conn, err := net.Dial("tcp", cfg.address)
+	conn, err := dialServer(cfg)
 	if err != nil {
-		fmt.Println("Connection error:", err)
+		errorf("Connection error: %v\n", err)
 		return exitIO
 	}
 	defer conn.Close()
@@ -892,17 +1120,18 @@ func runClientTUI(cfg clientConfig) int {
 		out:       s,
 	}
 	m.input.Placeholder = "message"
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tuiProgramOptions()...)
 	s.start(p)
 
 	go clientTUIReadLoop(conn, cfg, &closing, s)
 
 	final, err := p.Run()
 	closing.Store(true)
+	m.io.close()
 	conn.Close()
 	s.close()
-	if err != nil {
-		fmt.Println("TUI error:", err)
+	if err := tuiExitError(err); err != nil {
+		errorf("TUI error: %v\n", err)
 		return exitIO
 	}
 	cm, ok := final.(clientTUI)
@@ -944,6 +1173,7 @@ func clientTUIReadLoop(conn net.Conn, cfg clientConfig, closing *atomic.Bool, s 
 				s.clientFrame("Recv", colorGreen, message, fullFrame)
 			}); frameErr != nil {
 				if !closing.Load() {
+					logEventf("Receive error: %v", frameErr)
 					s.send(peerClosedMsg{err: frameErr})
 				}
 				return
@@ -959,8 +1189,10 @@ func clientTUIReadLoop(conn net.Conn, cfg clientConfig, closing *atomic.Bool, s 
 			}
 			flushIncomplete()
 			if errors.Is(err, io.EOF) {
+				logEventf("Connection closed by peer")
 				s.send(peerClosedMsg{})
 			} else {
+				logEventf("Receive error: %v", err)
 				s.send(peerClosedMsg{err: err})
 			}
 			return
@@ -1009,7 +1241,7 @@ func (m clientTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sendFailedMsg:
 		m.markDisconnected("send error: "+msg.err.Error(), exitIO)
 		return m, nil
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if handled, quit := m.handleKey(msg); handled {
 			if quit {
 				return m, tea.Quit
@@ -1022,54 +1254,75 @@ func (m clientTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.disconnected {
 			return m, nil
 		}
-		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
-		return m, cmd
+	case tea.PasteMsg:
+		if m.disconnected {
+			return m, nil
+		}
+		return m.paste(msg.Content)
 	}
-	return m, nil
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
 }
 
 func (m *clientTUI) applySize(w, h int) {
 	m.width = w
 	m.height = h
 	m.ready = true
-	m.viewport.Width = max(1, w)
-	m.viewport.Height = max(1, max(3, h-3)) // header, input, footer
-	m.input.Width = max(1, w-3)
-	m.contentWidth = m.viewport.Width
+	m.contentWidth = max(1, w)
+	m.contentHeight = max(3, h-3) // header, input, footer
+	m.input.SetWidth(max(1, w-3))
 	m.rerender()
+}
+
+// paste sends each complete pasted line in order, like typing it and
+// pressing Enter; text after the last newline stays in the input line.
+func (m clientTUI) paste(text string) (tea.Model, tea.Cmd) {
+	lines, rest := splitPaste(text)
+	for _, line := range lines {
+		m.input, _ = m.input.Update(tea.PasteMsg{Content: line})
+		next, _ := m.submit()
+		m = next.(clientTUI)
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(tea.PasteMsg{Content: rest})
+	return m, cmd
 }
 
 func (m clientTUI) submit() (tea.Model, tea.Cmd) {
 	if m.disconnected {
 		return m, nil
 	}
+	// An empty line is sent as a bare terminator (an empty frame).
 	line := m.takeInput()
-	if line == "" {
-		return m, nil
-	}
 	processed := processEscapeSequences(line)
 	frame := append([]byte(processed), m.cfg.sendTerminatorBytes...)
 	conn, timeout, out := m.conn, m.cfg.writeTimeout, m.out
-	// Report through the sink, not as the Cmd result, so the sent frame is
-	// queued with the received frames instead of racing them.
-	return m, runIO(func() {
+	// Report through the sink so the sent frame is queued with the received
+	// frames; the queue keeps sends in the order they were typed.
+	m.io.push(func() {
 		if err := writeConn(conn, frame, timeout); err != nil {
+			logEventf("Send error: %v", err)
 			out.send(sendFailedMsg{err: err})
 			return
 		}
 		out.clientFrame("Send", colorCyan, line, frame)
 	})
+	return m, nil
 }
 
-func (m clientTUI) View() string {
+func (m clientTUI) View() tea.View {
+	return fullScreen(m.render())
+}
+
+func (m clientTUI) render() string {
 	if !m.ready {
 		return "starting tui…"
 	}
 	if m.showHelp {
 		return renderHelp(m.width, m.height, clientTUIHelp)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, m.headerView(), m.viewport.View(), m.input.View(), m.footer(""))
+	return lipgloss.JoinVertical(lipgloss.Left, m.headerView(), m.logView(), m.input.View(), m.footer(""))
 }
 
 func (m clientTUI) headerView() string {
@@ -1089,6 +1342,8 @@ const clientTUIHelp = `coe client TUI
 
 Keys
   Enter             send the current line
+                    (an empty line sends just the terminator;
+                    pasted lines are sent one by one)
   F2                toggle hex dump under frames
   F1                toggle this help (Esc / q close it)
   PgUp / PgDn       scroll the frame log
@@ -1099,7 +1354,9 @@ When the peer closes the connection the log stays on
 screen; press Ctrl+C to exit.
 
 Escape sequences in messages: \r \n \t \\ \xHH
-Control bytes in frames are shown the same way.`
+Control bytes in frames are shown the same way.
+Frames longer than 2 KiB are shown in part;
+use --log to keep them in full.`
 
 func renderHelp(width, height int, body string) string {
 	style := lipgloss.NewStyle().
