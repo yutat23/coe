@@ -9,9 +9,12 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -40,75 +43,66 @@ type dummyAddr string
 func (a dummyAddr) Network() string { return "test" }
 func (a dummyAddr) String() string  { return string(a) }
 
-func captureStdout(t *testing.T, fn func()) string {
+// startCapture redirects *target to a pipe and drains it on a goroutine.
+// Reading only after fn returns would deadlock once the output outgrows the
+// pipe buffer, which on Windows is a few kilobytes.
+func startCapture(t *testing.T, target **os.File) (stop func() string) {
 	t.Helper()
 
-	originalStdout := os.Stdout
+	original := *target
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("os.Pipe() error: %v", err)
 	}
-
-	os.Stdout = w
-	defer func() {
-		os.Stdout = originalStdout
-		_ = r.Close()
+	*target = w
+	done := make(chan []byte, 1)
+	go func() {
+		out, _ := io.ReadAll(r)
+		done <- out
 	}()
+	return func() string {
+		*target = original
+		if err := w.Close(); err != nil {
+			t.Fatalf("pipe close error: %v", err)
+		}
+		out := <-done
+		_ = r.Close()
+		return string(out)
+	}
+}
 
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	stop := startCapture(t, &os.Stdout)
+	defer func() {
+		if stop != nil {
+			stop()
+		}
+	}()
 	fn()
-	if err := w.Close(); err != nil {
-		t.Fatalf("stdout pipe close error: %v", err)
-	}
-
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("stdout pipe read error: %v", err)
-	}
-	return string(out)
+	out := stop()
+	stop = nil
+	return out
 }
 
 func captureStdoutAndStderr(t *testing.T, fn func()) (string, string) {
 	t.Helper()
 
-	originalStdout := os.Stdout
-	originalStderr := os.Stderr
-	stdoutR, stdoutW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stdout os.Pipe() error: %v", err)
-	}
-	stderrR, stderrW, err := os.Pipe()
-	if err != nil {
-		_ = stdoutR.Close()
-		_ = stdoutW.Close()
-		t.Fatalf("stderr os.Pipe() error: %v", err)
-	}
-
-	os.Stdout = stdoutW
-	os.Stderr = stderrW
+	stopOut := startCapture(t, &os.Stdout)
+	stopErr := startCapture(t, &os.Stderr)
+	finished := false
 	defer func() {
-		os.Stdout = originalStdout
-		os.Stderr = originalStderr
-		_ = stdoutR.Close()
-		_ = stderrR.Close()
+		if !finished {
+			stopErr()
+			stopOut()
+		}
 	}()
-
 	fn()
-	if err := stdoutW.Close(); err != nil {
-		t.Fatalf("stdout pipe close error: %v", err)
-	}
-	if err := stderrW.Close(); err != nil {
-		t.Fatalf("stderr pipe close error: %v", err)
-	}
-
-	stdout, err := io.ReadAll(stdoutR)
-	if err != nil {
-		t.Fatalf("stdout pipe read error: %v", err)
-	}
-	stderr, err := io.ReadAll(stderrR)
-	if err != nil {
-		t.Fatalf("stderr pipe read error: %v", err)
-	}
-	return string(stdout), string(stderr)
+	finished = true
+	stderr := stopErr()
+	stdout := stopOut()
+	return stdout, stderr
 }
 
 func captureStdoutWithArgs(t *testing.T, args []string, fn func()) string {
@@ -121,6 +115,21 @@ func captureStdoutWithArgs(t *testing.T, args []string, fn func()) string {
 	}()
 
 	return captureStdout(t, fn)
+}
+
+// captureOutputWithArgs runs fn with os.Args set and returns stdout and
+// stderr joined, for tests that only care that a message was printed.
+func captureOutputWithArgs(t *testing.T, args []string, fn func()) string {
+	t.Helper()
+
+	originalArgs := os.Args
+	os.Args = args
+	defer func() {
+		os.Args = originalArgs
+	}()
+
+	stdout, stderr := captureStdoutAndStderr(t, fn)
+	return stdout + stderr
 }
 
 func captureStdoutWithArgsAndStdin(t *testing.T, args []string, stdin *os.File, fn func()) string {
@@ -581,6 +590,7 @@ func TestShowLogoAndUsageOutput(t *testing.T) {
 		"OPTIONS",
 		"ESCAPE SEQUENCES",
 		"Server mode commands:",
+		"--tui",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q: %q", want, out)
@@ -618,7 +628,7 @@ func TestMainArgumentHandling(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var code int
-			out := captureStdoutWithArgs(t, tt.args, func() {
+			out := captureOutputWithArgs(t, tt.args, func() {
 				code = runMain()
 			})
 			if code != tt.wantCode {
@@ -705,6 +715,16 @@ func TestRunClientArgumentValidation(t *testing.T) {
 			want: "Error: Unknown option --bad",
 		},
 		{
+			name: "tui requires a terminal",
+			args: []string{"coe", "-c", "127.0.0.1", "1234", "--tui"},
+			want: "Error: --tui requires a terminal",
+		},
+		{
+			name: "tui cannot be used with one-shot message",
+			args: []string{"coe", "-c", "127.0.0.1", "1234", "-m", "hi", "--tui"},
+			want: "Error: --tui cannot be used with -m",
+		},
+		{
 			name: "missing max frame size",
 			args: []string{"coe", "-c", "127.0.0.1", "1234", "--max-frame-size"},
 			want: "Error: Max frame size must be specified after --max-frame-size",
@@ -719,7 +739,7 @@ func TestRunClientArgumentValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var code int
-			out := captureStdoutWithArgs(t, tt.args, func() {
+			out := captureOutputWithArgs(t, tt.args, func() {
 				code = runClientWithExitCode()
 			})
 			if code != exitUsage {
@@ -789,9 +809,10 @@ func TestRunOneShotClientQuietWaitsForMultipleFrames(t *testing.T) {
 			t.Errorf("response write error: %v", err)
 			return
 		}
-		// Keep the connection open so the client must use the complete wait
-		// duration instead of stopping after the first response frame.
-		time.Sleep(180 * time.Millisecond)
+		// Keep the connection open until the client hangs up, so the client
+		// must use the complete wait duration instead of stopping after the
+		// first response frame.
+		_, _ = io.Copy(io.Discard, conn)
 	}()
 
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
@@ -889,7 +910,8 @@ func TestRunOneShotClientWaitReturnsThreeWithoutResponse(t *testing.T) {
 			t.Errorf("ReadString() error: %v", err)
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		// Never answer; hold the connection until the client gives up.
+		_, _ = io.Copy(io.Discard, reader)
 	}()
 
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
@@ -980,6 +1002,11 @@ func TestRunServerArgumentValidation(t *testing.T) {
 			want: "Error: Unknown option or terminator --bad",
 		},
 		{
+			name: "tui requires a terminal",
+			args: []string{"coe", "-s", "1234", "--tui"},
+			want: "Error: --tui requires a terminal",
+		},
+		{
 			name: "missing max frame size",
 			args: []string{"coe", "-s", "1234", "--max-frame-size"},
 			want: "Error: Max frame size must be specified after --max-frame-size",
@@ -1009,7 +1036,7 @@ func TestRunServerArgumentValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var code int
-			out := captureStdoutWithArgs(t, tt.args, func() {
+			out := captureOutputWithArgs(t, tt.args, func() {
 				code = runServer()
 			})
 			if code != exitUsage {
@@ -1122,6 +1149,15 @@ func TestRunClientConnectsSendsReceivesAndExitsOnStdinEOF(t *testing.T) {
 			t.Errorf("first frame = %q, want hello LF", first)
 			return
 		}
+		empty, err := reader.ReadString('\n')
+		if err != nil {
+			t.Errorf("ReadString(empty) error: %v", err)
+			return
+		}
+		if empty != "\n" {
+			t.Errorf("empty line was sent as %q, want a bare LF", empty)
+			return
+		}
 		if _, err := conn.Write([]byte("echo-one\n")); err != nil {
 			t.Errorf("write echo-one error: %v", err)
 			return
@@ -1154,8 +1190,8 @@ func TestRunClientConnectsSendsReceivesAndExitsOnStdinEOF(t *testing.T) {
 			t.Errorf("stdin write error: %v", err)
 			return
 		}
-		<-serverDone
-		time.Sleep(50 * time.Millisecond)
+		// End the input right away: the client half-closes and still reads
+		// echo-two, which the server sends after the last line.
 		if err := stdinW.Close(); err != nil {
 			t.Errorf("stdin close error: %v", err)
 		}
@@ -1166,7 +1202,7 @@ func TestRunClientConnectsSendsReceivesAndExitsOnStdinEOF(t *testing.T) {
 		t,
 		[]string{"coe", "-c", addr.IP.String(), strconv.Itoa(addr.Port), "LF", "--buffer-size", "3", "--no-color"},
 		stdinR,
-		runClient,
+		func() { runClientWithExitCode() },
 	)
 	<-serverDone
 	<-stdinDone
@@ -1176,6 +1212,7 @@ func TestRunClientConnectsSendsReceivesAndExitsOnStdinEOF(t *testing.T) {
 		"Buffer size: 3 bytes",
 		"Send] ",
 		"hello (Bytes: 6",
+		" (Bytes: 1, HEX: 0a)",
 		"line\\t2 (Bytes: 7",
 		"echo-one",
 		"echo-two",
@@ -1216,7 +1253,7 @@ func TestHandleClientEchoesCompleteFrames(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\r', '\n'}, true, 2, 0, 0, 0)
+		handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\r', '\n'}, echoEnabled: true, bufferSize: 2})
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -1239,7 +1276,7 @@ func TestHandleClientDoesNotEchoWhenDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 8, 0, 0, 0)
+		handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: false, bufferSize: 8})
 	}()
 
 	if _, err := client.Write([]byte("hello\n")); err != nil {
@@ -1282,7 +1319,7 @@ func TestHandleClientProcessesDataDeliveredWithEOF(t *testing.T) {
 	conn := &dataThenEOFConn{data: []byte("hello\nworld")}
 
 	out := captureStdout(t, func() {
-		handleClient(conn, []byte{'\n'}, []byte{'\n'}, true, 32, 0, 0, 0)
+		handleClient(conn, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: true, bufferSize: 32})
 	})
 
 	if got, want := conn.writes.String(), "hello\n"; got != want {
@@ -1302,7 +1339,7 @@ func TestHandleClientReceivesCRAndDropsFollowingLF(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleClient(server, []byte{'\r'}, []byte{'\n'}, true, 32, 0, 0, 0)
+		handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\r'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: true, bufferSize: 32})
 	}()
 
 	if _, err := client.Write([]byte("hello\r\nworld\r")); err != nil {
@@ -1454,7 +1491,7 @@ func TestHandleClientDropsOversizedFrame(t *testing.T) {
 	go func() {
 		defer close(done)
 		out = captureStdout(t, func() {
-			handleClient(server, []byte{'\n'}, []byte{'\n'}, false, 32, 0, 4, 0)
+			handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\n'}, echoEnabled: false, bufferSize: 32, maxFrameSize: 4})
 		})
 	}()
 
@@ -1521,7 +1558,7 @@ func TestSendToClientWriteTimeoutDropsClient(t *testing.T) {
 func TestInteractiveClientDialFailureExitCode(t *testing.T) {
 	port := freeTCPPort(t)
 	var code int
-	out := captureStdoutWithArgs(t, []string{"coe", "-c", "127.0.0.1", port, "--no-color"}, func() {
+	out := captureOutputWithArgs(t, []string{"coe", "-c", "127.0.0.1", port, "--no-color"}, func() {
 		code = runClientWithExitCode()
 	})
 	if code != exitIO {
@@ -1533,8 +1570,14 @@ func TestInteractiveClientDialFailureExitCode(t *testing.T) {
 }
 
 func TestRunServerBindFailureExitCode(t *testing.T) {
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer busy.Close()
+
 	var code int
-	out := captureStdoutWithArgs(t, []string{"coe", "-s", "not-a-port", "--no-color"}, func() {
+	out := captureOutputWithArgs(t, []string{"coe", "-s", busy.Addr().String(), "--no-color"}, func() {
 		code = runServer()
 	})
 	if code != exitIO {
@@ -1943,5 +1986,490 @@ func TestRunServerSendAcceptsTabSeparators(t *testing.T) {
 
 	if !strings.Contains(out, "Sent: hello") {
 		t.Fatalf("server output missing tab send: %q", out)
+	}
+}
+
+func TestDisplayTextEscapesControls(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"plain text", "plain text"},
+		{"A\r\nB\x1bC", `A\r\nB\x1BC`},
+		{"tab\there", `tab\there`},
+		{"\x1b]0;title\x07", `\x1B]0;title\x07`},
+		{"c1\u009bx", `c1\xC2\x9Bx`},
+		{"bad\xffutf8", `bad\xFFutf8`},
+		{"日本語", "日本語"},
+		{`back\slash`, `back\slash`},
+	}
+	for _, tt := range tests {
+		if got := displayText(tt.in); got != tt.want {
+			t.Errorf("displayText(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestLogLinesDoNotCarryRawControlBytes(t *testing.T) {
+	colorEnabled = false
+	out := captureStdout(t, func() {
+		logClientData("Recv", colorGreen, "hello\r", []byte("hello\r\n"))
+		logServerData("1.2.3.4:5", "Received", colorGreen, "\x1b[2Jx", []byte("\x1b[2Jx\n"))
+	})
+	if strings.ContainsAny(out, "\r\x1b") {
+		t.Fatalf("log output contains raw control bytes: %q", out)
+	}
+	if !strings.Contains(out, `hello\r (Bytes: 7`) || !strings.Contains(out, `\x1B[2Jx (Bytes: 6`) {
+		t.Fatalf("escaped payload missing: %q", out)
+	}
+}
+
+func TestParseClientTarget(t *testing.T) {
+	tests := []struct {
+		args     []string
+		want     string
+		wantUsed int
+		wantErr  bool
+	}{
+		{args: []string{"127.0.0.1", "8080"}, want: "127.0.0.1:8080", wantUsed: 2},
+		{args: []string{"127.0.0.1:8080"}, want: "127.0.0.1:8080", wantUsed: 1},
+		{args: []string{"127.0.0.1:8080", "LF"}, want: "127.0.0.1:8080", wantUsed: 1},
+		{args: []string{"localhost:8080", "--tui"}, want: "localhost:8080", wantUsed: 1},
+		{args: []string{"::1", "8080"}, want: "[::1]:8080", wantUsed: 2},
+		{args: []string{"[::1]:8080"}, want: "[::1]:8080", wantUsed: 1},
+		{args: []string{"host", "abc"}, wantErr: true},
+		{args: []string{"host", "0"}, wantErr: true},
+		{args: []string{"host", "65536"}, wantErr: true},
+		{args: []string{"host:99999"}, wantErr: true},
+		{args: []string{"host"}, wantErr: true},
+		{args: nil, wantErr: true},
+	}
+	for _, tt := range tests {
+		got, used, err := parseClientTarget(tt.args)
+		if (err != nil) != tt.wantErr {
+			t.Fatalf("parseClientTarget(%q) error = %v, wantErr %v", tt.args, err, tt.wantErr)
+		}
+		if !tt.wantErr && (got != tt.want || used != tt.wantUsed) {
+			t.Fatalf("parseClientTarget(%q) = %q, %d; want %q, %d", tt.args, got, used, tt.want, tt.wantUsed)
+		}
+	}
+}
+
+func TestParseServerAddress(t *testing.T) {
+	tests := []struct {
+		arg, host, port string
+		wantErr         bool
+	}{
+		{arg: "8080", port: "8080"},
+		{arg: "0", port: "0"},
+		{arg: "127.0.0.1:9000", host: "127.0.0.1", port: "9000"},
+		{arg: "[::1]:9000", host: "::1", port: "9000"},
+		{arg: ":9000", port: "9000"},
+		{arg: "abc", wantErr: true},
+		{arg: "70000", wantErr: true},
+		{arg: "--tui", wantErr: true},
+		{arg: "-1", wantErr: true},
+		{arg: "::1", wantErr: true},
+	}
+	for _, tt := range tests {
+		host, port, err := parseServerAddress(tt.arg)
+		if (err != nil) != tt.wantErr {
+			t.Fatalf("parseServerAddress(%q) error = %v, wantErr %v", tt.arg, err, tt.wantErr)
+		}
+		if !tt.wantErr && (host != tt.host || port != tt.port) {
+			t.Fatalf("parseServerAddress(%q) = %q, %q; want %q, %q", tt.arg, host, port, tt.host, tt.port)
+		}
+	}
+}
+
+func TestUsageErrorsForBadPortsAndOptionCombinations(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		run  func() int
+		want string
+	}{
+		{"server port is not a number", []string{"coe", "-s", "abc"}, runServer, "port must be a number"},
+		{"server port is an option", []string{"coe", "-s", "--tui"}, runServer, "port must be a number"},
+		{"server port out of range", []string{"coe", "-s", "70000"}, runServer, "port must be a number"},
+		{"bind with host:port", []string{"coe", "-s", "127.0.0.1:0", "--bind", "::1"}, runServer, "--bind cannot be combined"},
+		{"client port is not a number", []string{"coe", "-c", "127.0.0.1", "abc"}, runClientWithExitCode, "port must be a number"},
+		{"wait with tui", []string{"coe", "-c", "127.0.0.1", "1234", "--wait", "1s", "--tui"}, runClientWithExitCode, "--wait is only used with -m"},
+		{"quiet without message", []string{"coe", "-c", "127.0.0.1", "1234", "--quiet"}, runClientWithExitCode, "--quiet is only used with -m"},
+		{"flush timeout below 1ms", []string{"coe", "-c", "127.0.0.1", "1234", "--flush-timeout", "1ns"}, runClientWithExitCode, "at least 1ms"},
+		{"server flush timeout below 1ms", []string{"coe", "-s", "0", "--flush-timeout", "10us"}, runServer, "at least 1ms"},
+		{"negative connect timeout", []string{"coe", "-c", "127.0.0.1", "1234", "--connect-timeout", "-1s"}, runClientWithExitCode, "connect timeout must be 0 or greater"},
+		{"missing log file", []string{"coe", "-c", "127.0.0.1", "1234", "--log"}, runClientWithExitCode, "Log file must be specified after --log"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var code int
+			stdout, stderr := captureStdoutAndStderr(t, func() {
+				originalArgs := os.Args
+				os.Args = tt.args
+				defer func() { os.Args = originalArgs }()
+				code = tt.run()
+			})
+			if code != exitUsage {
+				t.Fatalf("exit code = %d, want %d; stdout=%q stderr=%q", code, exitUsage, stdout, stderr)
+			}
+			if !strings.Contains(stderr, tt.want) {
+				t.Fatalf("stderr = %q, want %q", stderr, tt.want)
+			}
+			if stdout != "" {
+				t.Fatalf("usage error leaked to stdout: %q", stdout)
+			}
+		})
+	}
+}
+
+func TestVersionFlag(t *testing.T) {
+	for _, arg := range []string{"--version", "-v", "version"} {
+		var code int
+		out := captureStdoutWithArgs(t, []string{"coe", arg}, func() { code = runMain() })
+		if code != exitOK || out != "coe "+version+"\n" {
+			t.Fatalf("%s: code=%d output=%q", arg, code, out)
+		}
+	}
+}
+
+func TestResolveColor(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	t.Setenv("NO_COLOR", "")
+	if resolveColor(colorAuto, w) {
+		t.Fatalf("auto color is on for a pipe")
+	}
+	if !resolveColor(colorOn, w) {
+		t.Fatalf("--color did not force color")
+	}
+	t.Setenv("NO_COLOR", "1")
+	if resolveColor(colorAuto, os.Stdout) {
+		t.Fatalf("NO_COLOR was ignored")
+	}
+	if !resolveColor(colorOn, w) {
+		t.Fatalf("--color should win over NO_COLOR")
+	}
+	if resolveColor(colorOff, w) {
+		t.Fatalf("--no-color left color on")
+	}
+}
+
+func TestLineOutputRedrawsVisiblePrompt(t *testing.T) {
+	saved := terminalControlEnabled
+	terminalControlEnabled = true
+	defer func() {
+		terminalControlEnabled = saved
+		promptConsumed()
+	}()
+
+	out := captureStdout(t, func() {
+		setPrompt("Send> ")
+		showPrompt()
+		showPrompt() // already showing: not drawn twice
+		lineOutput(func() { fmt.Println("event") })
+		promptConsumed() // Enter pressed
+		lineOutput(func() { fmt.Println("reply") })
+		showPrompt()
+		hidePrompt()
+	})
+	// After Enter, the prompt redrawn by "event" is erased before "reply".
+	want := "Send> " + "\r\033[K" + "event\n" + "Send> " + "\r\033[K" + "reply\n" + "Send> " + "\r\033[K"
+	if out != want {
+		t.Fatalf("output = %q, want %q", out, want)
+	}
+}
+
+func TestRunServerKeepsRunningWithoutUsableStdin(t *testing.T) {
+	interrupt, err := os.FindProcess(os.Getpid())
+	if err != nil || interrupt.Signal(syscall.Signal(0)) != nil {
+		t.Skip("cannot signal this process")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Interrupt cannot be sent to a process on Windows")
+	}
+
+	closedPipe := func(t *testing.T) *os.File {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error: %v", err)
+		}
+		w.Close() // like </dev/null or a container without -i
+		return r
+	}
+	writeOnly := func(t *testing.T) *os.File {
+		// GNU nohup reopens a terminal stdin like this, so reads fail.
+		f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("open %s: %v", os.DevNull, err)
+		}
+		return f
+	}
+	for _, tt := range []struct {
+		name  string
+		stdin func(*testing.T) *os.File
+		want  string
+	}{
+		{"stdin at EOF", closedPipe, "Standard input closed"},
+		{"stdin unreadable", writeOnly, "Standard input unreadable"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stdin := tt.stdin(t)
+			defer stdin.Close()
+			port := freeTCPPort(t)
+
+			done := make(chan struct{})
+			var code int
+			var out string
+			go func() {
+				defer close(done)
+				out = captureStdoutWithArgsAndStdin(t, []string{"coe", "-s", port, "--no-color"}, stdin, func() {
+					code = runServer()
+				})
+			}()
+
+			conn := waitForTCP(t, "127.0.0.1:"+port)
+			defer conn.Close()
+			for _, msg := range []string{"one\n", "two\n"} {
+				if _, err := conn.Write([]byte(msg)); err != nil {
+					t.Fatalf("write error: %v", err)
+				}
+				readUntilContains(t, conn, msg)
+				time.Sleep(100 * time.Millisecond) // give the end of stdin time to be handled
+			}
+			select {
+			case <-done:
+				t.Fatalf("server exited without usable stdin: %q", out)
+			default:
+			}
+
+			if err := interrupt.Signal(os.Interrupt); err != nil {
+				t.Fatalf("Signal() error: %v", err)
+			}
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("server did not stop on SIGINT")
+			}
+			if code != exitOK {
+				t.Fatalf("exit code = %d, want 0", code)
+			}
+			for _, want := range []string{tt.want, "Shutting down server...", "Client disconnected"} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("output missing %q: %q", want, out)
+				}
+			}
+		})
+	}
+}
+
+func TestInteractiveClientWaitBoundsPipedReplies(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+	release := make(chan struct{})
+	defer close(release)
+	// Answers once, then keeps the connection open after the client's FIN.
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+			conn.Write([]byte("pong\n"))
+		}
+		<-release
+	}()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer stdinR.Close()
+	stdinW.WriteString("ping\n")
+	stdinW.Close()
+
+	started := time.Now()
+	var code int
+	out := captureStdoutWithArgsAndStdin(t,
+		[]string{"coe", "-c", listener.Addr().String(), "--wait", "300ms", "--no-color"},
+		stdinR,
+		func() { code = runClientWithExitCode() })
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("client waited %s despite --wait 300ms", elapsed)
+	}
+	if code != exitOK || !strings.Contains(out, "| pong (Bytes") {
+		t.Fatalf("code=%d output=%q", code, out)
+	}
+}
+
+func TestInteractiveClientWithPipedInputKeepsReadingReplies(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+
+	// The server answers only after the client has finished sending, as a
+	// batch processor would; the client must still be reading by then.
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		request, _ := io.ReadAll(conn)
+		for _, line := range strings.Split(strings.TrimSuffix(string(request), "\n"), "\n") {
+			fmt.Fprintf(conn, "re:%s\n", line)
+		}
+	}()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer stdinR.Close()
+	if _, err := stdinW.WriteString("a\nb\n"); err != nil {
+		t.Fatalf("stdin write error: %v", err)
+	}
+	stdinW.Close()
+
+	addr := listener.Addr().(*net.TCPAddr)
+	var code int
+	out := captureStdoutWithArgsAndStdin(t,
+		[]string{"coe", "-c", addr.String(), "--no-color"},
+		stdinR,
+		func() { code = runClientWithExitCode() })
+
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want 0; output=%q", code, out)
+	}
+	for _, want := range []string{"| re:a (Bytes", "| re:b (Bytes", "Connection closed by peer"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q: %q", want, out)
+		}
+	}
+	if strings.Contains(out, "Receive error") {
+		t.Fatalf("a normal close was reported as an error: %q", out)
+	}
+}
+
+func TestHandleClientDoesNotReportNormalCloseAsError(t *testing.T) {
+	colorEnabled = false
+	server, client := net.Pipe()
+	out := captureStdout(t, func() {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			handleClient(server, serverConfig{recvTerminatorBytes: []byte{'\n'}, sendTerminatorBytes: []byte{'\n'}, bufferSize: 16})
+		}()
+		client.Close()
+		waitDone(t, done)
+	})
+	if strings.Contains(out, "Receive error") || !strings.Contains(out, "Client disconnected") {
+		t.Fatalf("output = %q", out)
+	}
+}
+
+type failingListener struct {
+	mu       sync.Mutex
+	failures int
+	calls    int
+}
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	if l.calls <= l.failures {
+		return nil, errors.New("accept: too many open files")
+	}
+	return nil, net.ErrClosed
+}
+func (l *failingListener) Close() error   { return nil }
+func (l *failingListener) Addr() net.Addr { return dummyAddr("listener") }
+
+func TestAcceptClientsBacksOffOnRepeatedErrors(t *testing.T) {
+	l := &failingListener{failures: 4}
+	var clients sync.Map
+	var count atomic.Int64
+	var shuttingDown atomic.Bool
+	started := time.Now()
+	out := captureStdout(t, func() {
+		acceptClients(l, serverConfig{}, &clients, &count, &shuttingDown, nil)
+	})
+	// 5ms + 10ms + 20ms + 40ms between the four failures.
+	if elapsed := time.Since(started); elapsed < 70*time.Millisecond {
+		t.Fatalf("accept loop retried without backing off (%s)", elapsed)
+	}
+	if got := strings.Count(out, "retrying in"); got != 4 {
+		t.Fatalf("logged %d retries, want 4: %q", got, out)
+	}
+}
+
+func TestOneShotClientWritesLogFile(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+			conn.Write([]byte("pong\x1b\n"))
+		}
+	}()
+
+	logPath := t.TempDir() + "/session.log"
+	var code int
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", listener.Addr().String(), "-m", "ping", "--wait", "200ms", "--quiet", "--log", logPath}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	if code != exitOK {
+		t.Fatalf("exit code = %d; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	log := string(data)
+	for _, want := range []string{"client connecting to " + listener.Addr().String(), "[Send] ", "| ping (Bytes: 5", "[Recv] ", `| pong\x1B (Bytes: 6`} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("log missing %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "\x1b") {
+		t.Fatalf("log contains raw escape bytes:\n%q", log)
+	}
+}
+
+func TestConnectTimeoutBoundsDial(t *testing.T) {
+	// 192.0.2.0/24 is reserved for documentation and is never routed, so the
+	// dial either times out or fails at once; it must not hang.
+	started := time.Now()
+	var code int
+	captureStdoutAndStderr(t, func() {
+		originalArgs := os.Args
+		os.Args = []string{"coe", "-c", "192.0.2.1", "9", "-m", "x", "--connect-timeout", "200ms"}
+		defer func() { os.Args = originalArgs }()
+		code = runClientWithExitCode()
+	})
+	if code != exitIO {
+		t.Fatalf("exit code = %d, want %d", code, exitIO)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("dial took %s with a 200ms connect timeout", elapsed)
 	}
 }

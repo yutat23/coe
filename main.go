@@ -15,14 +15,21 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
+// version is the single source of the release number. build.ps1 reads it
+// from here; a build can still override it with -ldflags "-X main.version=...".
+var version = "0.1.10"
+
 const (
-	version             = "0.1.9"
-	defaultBufferSize   = 1024
-	defaultMaxFrameSize = 1024 * 1024
-	defaultMaxClients   = 64
-	defaultWriteTimeout = 5 * time.Second
+	defaultBufferSize     = 1024
+	defaultMaxFrameSize   = 1024 * 1024
+	defaultMaxClients     = 64
+	defaultWriteTimeout   = 5 * time.Second
+	defaultConnectTimeout = 10 * time.Second
+	// A shorter flush timeout makes the read loop spin on deadlines.
+	minFlushTimeout = time.Millisecond
 
 	exitOK         = 0
 	exitIO         = 1
@@ -45,6 +52,11 @@ const (
 )
 
 var colorEnabled bool
+
+// colorMode is the --color / --no-color choice; the TUI passes it on to
+// Bubble Tea, which would otherwise decide on its own (and honor NO_COLOR
+// even over --color).
+var colorMode colorChoice
 var terminalControlEnabled bool
 
 func parseTerminator(name string) ([]byte, error) {
@@ -90,6 +102,9 @@ func parseFlushTimeout(value string) (time.Duration, error) {
 	}
 	if d < 0 {
 		return 0, fmt.Errorf("flush timeout must be 0 or greater")
+	}
+	if d > 0 && d < minFlushTimeout {
+		return 0, fmt.Errorf("flush timeout must be at least %s, or 0/off to disable it", minFlushTimeout)
 	}
 	return d, nil
 }
@@ -138,19 +153,93 @@ func parseMaxClients(value string) (int, error) {
 	return n, nil
 }
 
-func parseWriteTimeout(value string) (time.Duration, error) {
+// parseTimeout parses a timeout where 0, off, and none disable it.
+func parseTimeout(name, value string) (time.Duration, error) {
 	if strings.EqualFold(value, "off") || strings.EqualFold(value, "none") || value == "0" {
 		return 0, nil
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
-		return 0, fmt.Errorf("write timeout must be a duration like 5s, 100ms, or 0/off")
+		return 0, fmt.Errorf("%s must be a duration like 5s, 100ms, or 0/off", name)
 	}
 	if d < 0 {
-		return 0, fmt.Errorf("write timeout must be 0 or greater")
+		return 0, fmt.Errorf("%s must be 0 or greater", name)
 	}
 	return d, nil
 }
+
+func parseWriteTimeout(value string) (time.Duration, error) {
+	return parseTimeout("write timeout", value)
+}
+
+func parseConnectTimeout(value string) (time.Duration, error) {
+	return parseTimeout("connect timeout", value)
+}
+
+// parsePort accepts a decimal TCP port. Port 0 (pick a free port) is only
+// meaningful for a listener.
+func parsePort(value string, allowZero bool) (string, error) {
+	low := 1
+	if allowZero {
+		low = 0
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < low || n > 65535 || strings.HasPrefix(value, "+") {
+		return "", fmt.Errorf("port must be a number from %d to 65535, got %q", low, value)
+	}
+	return strconv.Itoa(n), nil
+}
+
+func isDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseServerAddress accepts "<port>" or "<host>:<port>" ("[::1]:8080" for
+// IPv6). An empty host listens on every interface.
+func parseServerAddress(arg string) (host, port string, err error) {
+	if strings.Contains(arg, ":") {
+		h, p, splitErr := net.SplitHostPort(arg)
+		if splitErr != nil {
+			return "", "", fmt.Errorf("address must be <port> or <host>:<port>, got %q", arg)
+		}
+		host, arg = h, p
+	}
+	port, err = parsePort(arg, true)
+	return host, port, err
+}
+
+// parseClientTarget reads "<host> <port>" or "<host>:<port>" from args and
+// returns the dial address and how many arguments it used. A bare IPv6
+// address such as ::1 does not split, so it is treated as a host.
+func parseClientTarget(args []string) (address string, used int, err error) {
+	if len(args) >= 1 {
+		if host, port, splitErr := net.SplitHostPort(args[0]); splitErr == nil && (len(args) == 1 || !isDecimal(args[1])) {
+			p, err := parsePort(port, false)
+			if err != nil {
+				return "", 0, err
+			}
+			return net.JoinHostPort(host, p), 1, nil
+		}
+	}
+	if len(args) < 2 {
+		return "", 0, errMissingTarget
+	}
+	p, err := parsePort(args[1], false)
+	if err != nil {
+		return "", 0, err
+	}
+	return net.JoinHostPort(args[0], p), 2, nil
+}
+
+var errMissingTarget = errors.New("missing host and port")
 
 func writeConn(conn net.Conn, data []byte, writeTimeout time.Duration) error {
 	if writeTimeout > 0 {
@@ -180,57 +269,90 @@ func splitHead(s string) (head, rest string) {
 	return s[:i], s[i+1:]
 }
 
-func stdinIsTerminal() bool {
-	info, err := os.Stdin.Stat()
-	return err == nil && (info.Mode()&os.ModeCharDevice) != 0
-}
-
-func clearInputLine() {
-	if terminalControlEnabled {
-		fmt.Print("\r\033[K")
+// displayText makes a payload safe to print on a terminal. Control bytes, C1
+// controls, and invalid UTF-8 are written with the same escape syntax that
+// outgoing messages accept (\r, \n, \t, \xHH), so a peer cannot move the
+// cursor, retitle the window, or hide the rest of a log line. A backslash in the
+// payload is left unchanged.
+func displayText(s string) string {
+	needsEscape := false
+	for _, r := range s {
+		if r < 0x20 || r == 0x7F || (r >= 0x80 && r <= 0x9F) || r == utf8.RuneError {
+			needsEscape = true
+			break
+		}
 	}
-}
-
-func printPrompt(prompt string) {
-	if terminalControlEnabled {
-		fmt.Print(prompt)
+	if !needsEscape {
+		return s
 	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7F || (r >= 0x80 && r <= 0x9F) || (r == utf8.RuneError && size == 1):
+			for _, c := range []byte(s[i : i+size]) {
+				fmt.Fprintf(&b, `\x%02X`, c)
+			}
+		default:
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
 }
 
-// logServerData prints one server-side data event:
+// formatServerLine renders one server-side data event:
 // "[addr] timestamp | Verb: message (Bytes: n, HEX: ...)".
-func logServerData(addr, verb, verbColor, message string, raw []byte) {
-	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+func formatServerLine(timestamp, addr, verb, verbColor, message string, raw []byte, color bool) string {
 	hexData := fmt.Sprintf("%x", raw)
-	if colorEnabled {
-		fmt.Printf("%s[%s]%s %s%s%s | %s%s:%s %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+	message = displayText(message)
+	if color {
+		return fmt.Sprintf("%s[%s]%s %s%s%s | %s%s:%s %s (Bytes: %s%d%s, HEX: %s%s%s)",
 			colorBlue, addr, colorReset,
 			colorYellow, timestamp, colorReset,
 			verbColor, verb, colorReset, message,
 			colorCyan, len(raw), colorReset,
 			colorPurple, hexData, colorReset)
-	} else {
-		fmt.Printf("[%s] %s | %s: %s (Bytes: %d, HEX: %s)\n",
-			addr, timestamp, verb, message, len(raw), hexData)
 	}
+	return fmt.Sprintf("[%s] %s | %s: %s (Bytes: %d, HEX: %s)",
+		addr, timestamp, verb, message, len(raw), hexData)
 }
 
-// logClientDataTo prints one client-side data event:
+// formatClientLine renders one client-side data event:
 // "[Tag] timestamp | message (Bytes: n, HEX: ...)".
-func logClientDataTo(w io.Writer, tag, tagColor, message string, raw []byte) {
-	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+func formatClientLine(timestamp, tag, tagColor, message string, raw []byte, color bool) string {
 	hexData := fmt.Sprintf("%x", raw)
-	if colorEnabled {
-		fmt.Fprintf(w, "%s[%s]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)\n",
+	message = displayText(message)
+	if color {
+		return fmt.Sprintf("%s[%s]%s %s%s%s | %s (Bytes: %s%d%s, HEX: %s%s%s)",
 			tagColor, tag, colorReset,
 			colorYellow, timestamp, colorReset,
 			message,
 			colorCyan, len(raw), colorReset,
 			colorPurple, hexData, colorReset)
-	} else {
-		fmt.Fprintf(w, "[%s] %s | %s (Bytes: %d, HEX: %s)\n",
-			tag, timestamp, message, len(raw), hexData)
 	}
+	return fmt.Sprintf("[%s] %s | %s (Bytes: %d, HEX: %s)",
+		tag, timestamp, message, len(raw), hexData)
+}
+
+// logServerData prints one server-side data event and mirrors it to --log.
+func logServerData(addr, verb, verbColor, message string, raw []byte) {
+	timestamp := logTimestamp()
+	fmt.Println(formatServerLine(timestamp, addr, verb, verbColor, message, raw, colorEnabled))
+	logLine(formatServerLine(timestamp, addr, verb, verbColor, message, raw, false))
+}
+
+// logClientDataTo prints one client-side data event to w and mirrors it to --log.
+func logClientDataTo(w io.Writer, tag, tagColor, message string, raw []byte) {
+	timestamp := logTimestamp()
+	fmt.Fprintln(w, formatClientLine(timestamp, tag, tagColor, message, raw, colorEnabled))
+	logLine(formatClientLine(timestamp, tag, tagColor, message, raw, false))
 }
 
 func logClientData(tag, tagColor, message string, raw []byte) {
@@ -275,6 +397,11 @@ func discardOrphanLFAfterCR(messageBuffer *bytes.Buffer, recvTerm []byte) bool {
 	return false
 }
 
+// isClosedByPeer reports a normal end of the connection rather than a failure.
+func isClosedByPeer(err error) bool {
+	return errors.Is(err, io.EOF)
+}
+
 func main() {
 	exitCode := runMain()
 	if exitCode != 0 {
@@ -298,14 +425,21 @@ func runMain() int {
 	case "-h", "--help", "help":
 		fullUsage()
 		return exitOK
+	case "-v", "--version", "version":
+		fmt.Printf("coe %s\n", version)
+		return exitOK
 	default:
-		fmt.Println("Error: Mode must be '-s'/'--server' or '-c'/'--client'")
-		shortUsage()
+		errorf("Error: Mode must be '-s'/'--server' or '-c'/'--client'\n")
+		shortUsageTo(os.Stderr)
 		return exitUsage
 	}
 }
 
 func showLogo() {
+	showLogoTo(os.Stdout)
+}
+
+func showLogoTo(w io.Writer) {
 	logoLines := []string{
 		" ██████╗ ██████╗ ███████╗",
 		"██╔════╝██╔═══██╗██╔════╝",
@@ -318,49 +452,63 @@ func showLogo() {
 		" Version " + version,
 	}
 	for _, line := range logoLines {
-		fmt.Println(line)
+		fmt.Fprintln(w, line)
 	}
 }
 
 func shortUsage() {
-	showLogo()
-	fmt.Println("")
-	fmt.Println("USAGE")
-	fmt.Println("  Server mode:  coe -s <port> [terminator] [options]")
-	fmt.Println("  Client mode:  coe -c <IP> <port> [terminator] [options]")
-	fmt.Println("")
-	fmt.Println("Use 'coe --help' for detailed options and examples.")
+	shortUsageTo(os.Stdout)
+}
+
+func shortUsageTo(w io.Writer) {
+	showLogoTo(w)
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "USAGE")
+	fmt.Fprintln(w, "  Server mode:  coe -s [host:]<port> [terminator] [options]")
+	fmt.Fprintln(w, "  Client mode:  coe -c <host> <port> [terminator] [options]")
+	fmt.Fprintln(w, "                coe -c <host>:<port> [terminator] [options]")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Use 'coe --help' for detailed options and examples.")
 }
 
 func fullUsage() {
 	showLogo()
 	fmt.Println("")
 	fmt.Println("USAGE")
-	fmt.Println("  Server mode:   coe -s, --server <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
-	fmt.Println("                 [--no-echo] [--buffer-size <size>] [--max-frame-size <size>] [--max-clients <n>]")
-	fmt.Println("                 [--write-timeout <duration>] [--flush-timeout <duration>] [--color] [--no-color]")
-	fmt.Println("  Client mode:   coe -c, --client <IP> <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
-	fmt.Println("                 [-m, --message <message>] [--wait <duration>] [--quiet]")
-	fmt.Println("                 [--buffer-size <size>] [--max-frame-size <size>] [--write-timeout <duration>]")
-	fmt.Println("                 [--flush-timeout <duration>] [--color] [--no-color]")
+	fmt.Println("  Server mode:   coe -s, --server [host:]<port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T]")
+	fmt.Println("                 [--bind <host>] [--no-echo] [--buffer-size <size>] [--max-frame-size <size>]")
+	fmt.Println("                 [--max-clients <n>] [--write-timeout <duration>] [--flush-timeout <duration>]")
+	fmt.Println("                 [--log <file>] [--tui] [--color] [--no-color]")
+	fmt.Println("  Client mode:   coe -c, --client <host> <port> | <host>:<port> [terminator] [-tt T] [-rt T]")
+	fmt.Println("                 [--tx-term T] [--rx-term T] [-m, --message <message> [--wait <duration>] [--quiet]]")
+	fmt.Println("                 [--connect-timeout <duration>] [--buffer-size <size>] [--max-frame-size <size>]")
+	fmt.Println("                 [--write-timeout <duration>] [--flush-timeout <duration>] [--log <file>] [--tui]")
+	fmt.Println("                 [--color] [--no-color]")
+	fmt.Println("  Version:       coe -v, --version")
 	fmt.Println("")
 	fmt.Println("OPTIONS")
 	fmt.Println("Terminator: LF, CR, or CRLF (CR+LF). Positional sets both sides unless overridden; omit when -tt and -rt cover both.")
 	fmt.Println("-tt T, --tx-term T   Outgoing delimiter (#send/#broadcast, echo, client send); --send-terminator is an alias")
 	fmt.Println("-rt T, --rx-term T   Frame incoming data until this sequence; --recv-terminator is an alias")
+	fmt.Println("--bind <host>    Listen on one address only, e.g. 127.0.0.1 (Server mode only); default is every interface")
 	fmt.Println("--no-echo        Disable echo back (Server mode only)")
 	fmt.Println("--buffer-size    Specify read chunk size (bytes) - Default is 1024")
 	fmt.Println("--max-frame-size Maximum assembled receive frame in bytes; 0 is unlimited - Default is 1048576")
 	fmt.Println("--max-clients    Maximum concurrent clients (Server mode only); 0 is unlimited - Default is 64")
 	fmt.Println("--write-timeout  Deadline for each socket write (e.g. 5s); 0/off disables - Default is 5s")
-	fmt.Println("--flush-timeout  Show incomplete buffered data after inactivity (e.g. 100ms); Default is off")
+	fmt.Println("--connect-timeout Give up connecting after this long (Client mode only); 0/off disables - Default is 10s")
+	fmt.Println("--flush-timeout  Show incomplete buffered data after inactivity (e.g. 100ms, at least 1ms); Default is off")
 	fmt.Println("-m, --message    Send one message and exit without the interactive prompt")
-	fmt.Println("--wait           After sending, receive frames for this duration; default is off")
-	fmt.Println("--quiet          In one-shot mode, write response payloads to stdout and logs to stderr")
-	fmt.Println("--color          Enable colored output for better readability (Default: enabled)")
-	fmt.Println("--no-color       Disable colored output")
+	fmt.Println("--wait           With -m, receive frames for this duration after sending; default is off")
+	fmt.Println("                 With piped input, wait at most this long for replies after the input ends")
+	fmt.Println("--quiet          With -m, write response payloads to stdout and logs to stderr")
+	fmt.Println("--log <file>     Append frames and connection events to a file (no colors)")
+	fmt.Println("--tui            Interactive TUI (requires a terminal). Not used with -m / --message")
+	fmt.Println("--color          Always color the output")
+	fmt.Println("--no-color       Never color the output")
+	fmt.Println("                 Default: color only on a terminal, and not when NO_COLOR is set")
 	fmt.Println("")
-	fmt.Println("COLOR CODING (when --color is enabled)")
+	fmt.Println("COLOR CODING")
 	fmt.Println("  Blue    - Client IP addresses")
 	fmt.Println("  Green   - Received messages")
 	fmt.Println("  Red     - Sent messages")
@@ -374,191 +522,246 @@ func fullUsage() {
 	fmt.Println("  \\t     - TAB (0x09)")
 	fmt.Println("  \\\\     - Backslash (0x5C)")
 	fmt.Println("  \\xHH   - Arbitrary byte in hex (e.g., \\x1B for ESC)")
+	fmt.Println("  An empty line in the interactive client sends just the terminator.")
 	fmt.Println("")
 	fmt.Println("EXAMPLES")
 	fmt.Println("  coe -s 8080")
 	fmt.Println("  coe -s 8080 CR")
+	fmt.Println("  coe -s 127.0.0.1:8080")
 	fmt.Println("  coe -s 8080 LF --no-echo")
 	fmt.Println("  coe -s 8080 --buffer-size 2048")
 	fmt.Println("  coe -s 8080 --flush-timeout 100ms")
 	fmt.Println("  coe -s 8080 --max-frame-size 4096 --max-clients 8 --write-timeout 2s")
-	fmt.Println("  coe -s 8080 --color")
-	fmt.Println("  coe -s 8080 --no-color")
+	fmt.Println("  coe -s 8080 --log session.log")
+	fmt.Println("  coe -s 8080 --tui")
 	fmt.Println("  coe -c 127.0.0.1 8080 LF")
+	fmt.Println("  coe -c 127.0.0.1:8080")
 	fmt.Println("  coe -c 127.0.0.1 8080 LF --flush-timeout 100ms")
 	fmt.Println("  coe -c 127.0.0.1 8080 -tt CR -rt CRLF")
 	fmt.Println("  coe -c 127.0.0.1 8080 -m \"STATUS\\r\" --wait 1s --quiet")
 	fmt.Println("  coe -c 127.0.0.1 8080 CR -rt CRLF")
-	fmt.Println("  coe --client 192.168.1.100 8080 CR --buffer-size 512 --color")
+	fmt.Println("  coe --client 192.168.1.100 8080 CR --buffer-size 512 --connect-timeout 3s")
 	fmt.Println("  coe --client 192.168.1.100 8080 CR --no-color")
+	fmt.Println("  coe --client 192.168.1.100 8080 --tui")
 }
 
-func runServer() int {
+func serverUsage() string {
+	return "Usage: -s, --server [host:]<port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T] [--bind <host>] [--no-echo] [--buffer-size <size>] [--max-frame-size <size>] [--max-clients <n>] [--write-timeout <duration>] [--flush-timeout <duration>] [--log <file>] [--tui] [--color] [--no-color]"
+}
+
+// parseServerConfig reads the server arguments. The returned error is
+// already worded for the user.
+func parseServerConfig() (serverConfig, string, colorChoice, error) {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: -s, --server <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T] [--no-echo] [--buffer-size <size>] [--max-frame-size <size>] [--max-clients <n>] [--write-timeout <duration>] [--flush-timeout <duration>] [--color] [--no-color]")
-		return exitUsage
+		return serverConfig{}, "", colorAuto, errors.New(serverUsage())
 	}
 
-	port := os.Args[2]
-	var legacyTerminator string
-	var sendTerminatorName, recvTerminatorName string
-	echoEnabled := true
-	bufferSize := defaultBufferSize
-	maxFrameSize := defaultMaxFrameSize
-	maxClients := defaultMaxClients
-	writeTimeout := defaultWriteTimeout
-	flushTimeout := time.Duration(0)
-	colorEnabled = true
-	terminalControlEnabled = stdinIsTerminal()
+	cfg := serverConfig{
+		echoEnabled:  true,
+		bufferSize:   defaultBufferSize,
+		maxFrameSize: defaultMaxFrameSize,
+		maxClients:   defaultMaxClients,
+		writeTimeout: defaultWriteTimeout,
+	}
+	var err error
+	cfg.host, cfg.port, err = parseServerAddress(os.Args[2])
+	if err != nil {
+		return serverConfig{}, "", colorAuto, fmt.Errorf("Error: %w", err)
+	}
+	hostInAddress := cfg.host != ""
+
+	var legacyTerminator, logPath string
+	choice := colorAuto
+	value := func(i int, what string) (string, error) {
+		if i+1 >= len(os.Args) {
+			return "", fmt.Errorf("Error: %s must be specified after %s", what, os.Args[i])
+		}
+		return os.Args[i+1], nil
+	}
 
 	for i := 3; i < len(os.Args); i++ {
 		arg := os.Args[i]
-		if arg == "--no-echo" {
-			echoEnabled = false
-		} else if arg == "--buffer-size" {
-			if i+1 >= len(os.Args) {
-				fmt.Println("Error: Buffer size must be specified after --buffer-size")
-				return exitUsage
-			}
-			var err error
-			bufferSize, err = parseBufferSize(os.Args[i+1])
+		switch {
+		case arg == "--no-echo":
+			cfg.echoEnabled = false
+		case arg == "--buffer-size":
+			v, err := value(i, "Buffer size")
 			if err != nil {
-				fmt.Println("Error:", err)
-				return exitUsage
+				return serverConfig{}, "", choice, err
+			}
+			if cfg.bufferSize, err = parseBufferSize(v); err != nil {
+				return serverConfig{}, "", choice, fmt.Errorf("Error: %w", err)
 			}
 			i++
-		} else if arg == "--max-frame-size" {
-			if i+1 >= len(os.Args) {
-				fmt.Println("Error: Max frame size must be specified after --max-frame-size")
-				return exitUsage
-			}
-			var err error
-			maxFrameSize, err = parseMaxFrameSize(os.Args[i+1])
+		case arg == "--max-frame-size":
+			v, err := value(i, "Max frame size")
 			if err != nil {
-				fmt.Println("Error:", err)
-				return exitUsage
+				return serverConfig{}, "", choice, err
+			}
+			if cfg.maxFrameSize, err = parseMaxFrameSize(v); err != nil {
+				return serverConfig{}, "", choice, fmt.Errorf("Error: %w", err)
 			}
 			i++
-		} else if arg == "--max-clients" {
-			if i+1 >= len(os.Args) {
-				fmt.Println("Error: Max clients must be specified after --max-clients")
-				return exitUsage
-			}
-			var err error
-			maxClients, err = parseMaxClients(os.Args[i+1])
+		case arg == "--max-clients":
+			v, err := value(i, "Max clients")
 			if err != nil {
-				fmt.Println("Error:", err)
-				return exitUsage
+				return serverConfig{}, "", choice, err
+			}
+			if cfg.maxClients, err = parseMaxClients(v); err != nil {
+				return serverConfig{}, "", choice, fmt.Errorf("Error: %w", err)
 			}
 			i++
-		} else if arg == "--write-timeout" {
-			if i+1 >= len(os.Args) {
-				fmt.Println("Error: Write timeout must be specified after --write-timeout")
-				return exitUsage
-			}
-			var err error
-			writeTimeout, err = parseWriteTimeout(os.Args[i+1])
+		case arg == "--write-timeout":
+			v, err := value(i, "Write timeout")
 			if err != nil {
-				fmt.Println("Error:", err)
-				return exitUsage
+				return serverConfig{}, "", choice, err
+			}
+			if cfg.writeTimeout, err = parseWriteTimeout(v); err != nil {
+				return serverConfig{}, "", choice, fmt.Errorf("Error: %w", err)
 			}
 			i++
-		} else if arg == "--flush-timeout" {
-			if i+1 >= len(os.Args) {
-				fmt.Println("Error: Flush timeout must be specified after --flush-timeout")
-				return exitUsage
-			}
-			var err error
-			flushTimeout, err = parseFlushTimeout(os.Args[i+1])
+		case arg == "--flush-timeout":
+			v, err := value(i, "Flush timeout")
 			if err != nil {
-				fmt.Println("Error:", err)
-				return exitUsage
+				return serverConfig{}, "", choice, err
+			}
+			if cfg.flushTimeout, err = parseFlushTimeout(v); err != nil {
+				return serverConfig{}, "", choice, fmt.Errorf("Error: %w", err)
 			}
 			i++
-		} else if arg == "-tt" || arg == "--tx-term" || arg == "--send-terminator" {
+		case arg == "--bind":
+			v, err := value(i, "Address")
+			if err != nil {
+				return serverConfig{}, "", choice, err
+			}
+			if hostInAddress {
+				return serverConfig{}, "", choice, fmt.Errorf("Error: --bind cannot be combined with host:port")
+			}
+			cfg.host = strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
+			i++
+		case arg == "--log":
+			v, err := value(i, "Log file")
+			if err != nil {
+				return serverConfig{}, "", choice, err
+			}
+			logPath = v
+			i++
+		case arg == "-tt" || arg == "--tx-term" || arg == "--send-terminator":
 			if i+1 >= len(os.Args) {
-				fmt.Println("Error: Value required after -tt / --tx-term (LF, CR, or CRLF)")
-				return exitUsage
+				return serverConfig{}, "", choice, fmt.Errorf("Error: Value required after -tt / --tx-term (LF, CR, or CRLF)")
 			}
-			sendTerminatorName = os.Args[i+1]
+			cfg.sendTerminatorName = os.Args[i+1]
 			i++
-		} else if arg == "-rt" || arg == "--rx-term" || arg == "--recv-terminator" {
+		case arg == "-rt" || arg == "--rx-term" || arg == "--recv-terminator":
 			if i+1 >= len(os.Args) {
-				fmt.Println("Error: Value required after -rt / --rx-term (LF, CR, or CRLF)")
-				return exitUsage
+				return serverConfig{}, "", choice, fmt.Errorf("Error: Value required after -rt / --rx-term (LF, CR, or CRLF)")
 			}
-			recvTerminatorName = os.Args[i+1]
+			cfg.recvTerminatorName = os.Args[i+1]
 			i++
-		} else if arg == "--color" {
-			colorEnabled = true
-		} else if arg == "--no-color" {
-			colorEnabled = false
-		} else if legacyTerminator == "" && terminatorToken(arg) {
+		case arg == "--tui":
+			cfg.tui = true
+		case arg == "--color":
+			choice = colorOn
+		case arg == "--no-color":
+			choice = colorOff
+		case legacyTerminator == "" && terminatorToken(arg):
 			legacyTerminator = arg
-		} else {
-			fmt.Printf("Error: Unknown option or terminator %s\n", arg)
-			return exitUsage
+		default:
+			return serverConfig{}, "", choice, fmt.Errorf("Error: Unknown option or terminator %s", arg)
 		}
 	}
 
 	if legacyTerminator != "" {
-		if sendTerminatorName == "" {
-			sendTerminatorName = legacyTerminator
+		if cfg.sendTerminatorName == "" {
+			cfg.sendTerminatorName = legacyTerminator
 		}
-		if recvTerminatorName == "" {
-			recvTerminatorName = legacyTerminator
+		if cfg.recvTerminatorName == "" {
+			cfg.recvTerminatorName = legacyTerminator
 		}
 	}
-	if sendTerminatorName == "" {
-		sendTerminatorName = "LF"
+	if cfg.sendTerminatorName == "" {
+		cfg.sendTerminatorName = "LF"
 	}
-	if recvTerminatorName == "" {
-		recvTerminatorName = "LF"
+	if cfg.recvTerminatorName == "" {
+		cfg.recvTerminatorName = "LF"
 	}
+	if cfg.sendTerminatorBytes, err = parseTerminator(cfg.sendTerminatorName); err != nil {
+		return serverConfig{}, "", choice, fmt.Errorf("Error (-tt / --tx-term): %w", err)
+	}
+	if cfg.recvTerminatorBytes, err = parseTerminator(cfg.recvTerminatorName); err != nil {
+		return serverConfig{}, "", choice, fmt.Errorf("Error (-rt / --rx-term): %w", err)
+	}
+	return cfg, logPath, choice, nil
+}
 
-	sendTerminatorBytes, err := parseTerminator(sendTerminatorName)
+func runServer() int {
+	cfg, logPath, choice, err := parseServerConfig()
 	if err != nil {
-		fmt.Println("Error (-tt / --tx-term):", err)
+		errorf("%v\n", err)
 		return exitUsage
 	}
-	recvTerminatorBytes, err := parseTerminator(recvTerminatorName)
-	if err != nil {
-		fmt.Println("Error (-rt / --rx-term):", err)
+	colorEnabled = resolveColor(choice, os.Stdout)
+	colorMode = choice
+	terminalControlEnabled = promptRedrawAvailable()
+	if cfg.tui && !tuiAvailable() {
+		errorf("Error: --tui requires a terminal\n")
 		return exitUsage
 	}
 
-	listener, err := net.Listen("tcp", ":"+port)
+	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.host, cfg.port))
 	if err != nil {
-		fmt.Println("Server startup error:", err)
+		errorf("Server startup error: %v\n", err)
 		return exitIO
 	}
 	defer listener.Close()
+	// With port 0 the system picks one; report the port actually in use.
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		cfg.port = strconv.Itoa(tcpAddr.Port)
+	}
 
-	fmt.Printf("Server started on port: %s\n", port)
-	fmt.Printf("Send terminator:    %s (%s)\n", strings.ToUpper(sendTerminatorName), terminatorHexDescription(sendTerminatorBytes))
-	fmt.Printf("Receive terminator: %s (%s)\n", strings.ToUpper(recvTerminatorName), terminatorHexDescription(recvTerminatorBytes))
-	fmt.Printf("Buffer size: %d bytes\n", bufferSize)
-	if maxFrameSize > 0 {
-		fmt.Printf("Max frame size: %d bytes\n", maxFrameSize)
+	if logPath != "" {
+		closer, err := openLogFile(logPath)
+		if err != nil {
+			errorf("Error: cannot open log file: %v\n", err)
+			return exitIO
+		}
+		defer func() {
+			setLogWriter(nil)
+			closer.Close()
+		}()
+		logEventf("coe %s server listening on %s", version, listener.Addr())
+	}
+
+	if cfg.tui {
+		return runServerTUI(cfg, listener)
+	}
+
+	fmt.Printf("Server started on port: %s\n", cfg.port)
+	fmt.Printf("Listening on: %s\n", listener.Addr())
+	fmt.Printf("Send terminator:    %s (%s)\n", strings.ToUpper(cfg.sendTerminatorName), terminatorHexDescription(cfg.sendTerminatorBytes))
+	fmt.Printf("Receive terminator: %s (%s)\n", strings.ToUpper(cfg.recvTerminatorName), terminatorHexDescription(cfg.recvTerminatorBytes))
+	fmt.Printf("Buffer size: %d bytes\n", cfg.bufferSize)
+	if cfg.maxFrameSize > 0 {
+		fmt.Printf("Max frame size: %d bytes\n", cfg.maxFrameSize)
 	} else {
 		fmt.Println("Max frame size: Unlimited")
 	}
-	if maxClients > 0 {
-		fmt.Printf("Max clients: %d\n", maxClients)
+	if cfg.maxClients > 0 {
+		fmt.Printf("Max clients: %d\n", cfg.maxClients)
 	} else {
 		fmt.Println("Max clients: Unlimited")
 	}
-	if writeTimeout > 0 {
-		fmt.Printf("Write timeout: %s\n", writeTimeout)
+	if cfg.writeTimeout > 0 {
+		fmt.Printf("Write timeout: %s\n", cfg.writeTimeout)
 	} else {
 		fmt.Println("Write timeout: Off")
 	}
-	if flushTimeout > 0 {
-		fmt.Printf("Flush timeout: %s\n", flushTimeout)
+	if cfg.flushTimeout > 0 {
+		fmt.Printf("Flush timeout: %s\n", cfg.flushTimeout)
 	} else {
 		fmt.Println("Flush timeout: Off")
 	}
-	if echoEnabled {
+	if cfg.echoEnabled {
 		fmt.Println("Echo back: Enabled")
 	} else {
 		fmt.Println("Echo back: Disabled")
@@ -574,117 +777,202 @@ func runServer() int {
 	var clients sync.Map
 	var clientCount atomic.Int64
 	var shuttingDown atomic.Bool
+	var handlers sync.WaitGroup
 
-	closeClients := func() {
+	shutdown := func() {
+		hidePrompt()
+		lineOutput(func() { fmt.Println("Shutting down server...") })
+		logEventf("Server shutting down")
+		shuttingDown.Store(true)
+		listener.Close()
 		clients.Range(func(key, value interface{}) bool {
-			conn := value.(net.Conn)
-			conn.Close()
-			fmt.Printf("Disconnected client: %s\n", key)
+			value.(net.Conn).Close()
+			sink().printf("Disconnected client: %s\n", key)
 			return true
 		})
+		// Let the handlers print their last lines (and reach --log) before
+		// the caller restores the terminal or exits.
+		waitBounded(&handlers, time.Second)
 	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+
+	go acceptClients(listener, cfg, &clients, &clientCount, &shuttingDown, &handlers)
+
+	// Read commands on a separate goroutine so that signals are handled in
+	// one place and the server can keep running after stdin ends.
+	lines := make(chan string)
+	inputDone := make(chan error, 1)
+	stopInput := make(chan struct{})
+	defer close(stopInput)
+	stdin := os.Stdin // read once; the goroutine may outlive this call
 	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down server...")
-		shuttingDown.Store(true)
-		closeClients()
-		listener.Close()
-		os.Exit(0)
-	}()
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				if shuttingDown.Load() || errors.Is(err, net.ErrClosed) {
-					return
-				}
-				fmt.Println("Connection error:", err)
-				continue
+		scanner := bufio.NewScanner(stdin)
+		scanner.Buffer(make([]byte, 1024), 1024*1024)
+		for scanner.Scan() {
+			select {
+			case lines <- scanner.Text():
+			case <-stopInput:
+				return
 			}
-
-			clientAddr := conn.RemoteAddr().String()
-			if maxClients > 0 && int(clientCount.Load()) >= maxClients {
-				fmt.Printf("Rejected client %s: max clients (%d) reached\n", clientAddr, maxClients)
-				conn.Close()
-				continue
-			}
-
-			fmt.Printf("Client connected: %s\n", clientAddr)
-			clients.Store(clientAddr, conn)
-			clientCount.Add(1)
-
-			go func() {
-				handleClient(conn, recvTerminatorBytes, sendTerminatorBytes, echoEnabled, bufferSize, flushTimeout, maxFrameSize, writeTimeout)
-				clients.Delete(clientAddr)
-				clientCount.Add(-1)
-			}()
 		}
+		inputDone <- scanner.Err()
 	}()
 
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024), 1024*1024)
-	printPrompt("Command> ")
-	for scanner.Scan() {
-		cmd, rest := splitHead(scanner.Text())
-		if cmd == "" {
-			printPrompt("Command> ")
+	setPrompt("Command> ")
+	showPrompt()
+	for {
+		select {
+		case <-sigChan:
+			shutdown()
+			return exitOK
+		case line := <-lines:
+			promptConsumed()
+			if quit := runServerCommand(line, &clients, cfg); quit {
+				shutdown()
+				return exitOK
+			}
+			showPrompt()
+		case err := <-inputDone:
+			inputDone = nil
+			if stdinIsTerminal() {
+				if err != nil {
+					hidePrompt()
+					errorf("Input error: %v\n", err)
+					shutdown()
+					return exitIO
+				}
+				// Ctrl+D on a terminal is a request to leave.
+				shutdown()
+				return exitOK
+			}
+			// Background jobs, services, and containers often start with
+			// stdin closed, at /dev/null, or unreadable (GNU nohup reopens it
+			// write-only); none of that may stop the server.
+			reason := "Standard input closed"
+			if err != nil {
+				reason = fmt.Sprintf("Standard input unreadable (%v)", err)
+			}
+			lineOutput(func() {
+				fmt.Printf("%s; commands are off. The server keeps running until Ctrl+C or SIGTERM.\n", reason)
+			})
+		}
+	}
+}
+
+// runServerCommand runs one line of the server prompt and reports whether
+// the server should shut down.
+func runServerCommand(line string, clients *sync.Map, cfg serverConfig) (quit bool) {
+	cmd, rest := splitHead(line)
+	if cmd == "" {
+		return false
+	}
+	switch cmd {
+	case "#send":
+		clientAddr, message := splitHead(rest)
+		if clientAddr == "" {
+			lineOutput(func() { fmt.Println("Usage: #send <clientAddr> <message>") })
+		} else {
+			sendToClient(clients, clientAddr, message, cfg.sendTerminatorBytes, cfg.writeTimeout)
+		}
+	case "#broadcast":
+		broadcastToAll(clients, rest, cfg.sendTerminatorBytes, cfg.writeTimeout)
+	case "#list":
+		listClients(clients)
+	case "#help":
+		sub, _ := splitHead(rest)
+		if sub == "program" {
+			lineOutput(fullUsage)
+		} else {
+			lineOutput(printServerHelp)
+		}
+	case "#quit", "#exit":
+		return true
+	default:
+		lineOutput(func() {
+			fmt.Printf("Unknown command: %s\n", cmd)
+			fmt.Println("Available commands: #send, #broadcast, #list, #help, #quit")
+		})
+	}
+	return false
+}
+
+// waitBounded waits for wg, but gives up after limit so a stuck connection
+// cannot hold up shutdown.
+func waitBounded(wg *sync.WaitGroup, limit time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+	}
+}
+
+// acceptClients serves connections until the listener closes. handlers, if
+// not nil, tracks the per-connection goroutines.
+func acceptClients(listener net.Listener, cfg serverConfig, clients *sync.Map, clientCount *atomic.Int64, shuttingDown *atomic.Bool, handlers *sync.WaitGroup) {
+	var delay time.Duration
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if shuttingDown.Load() || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// Errors such as EMFILE (too many open files) repeat at once;
+			// back off so the loop does not spin and flood the log.
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+			} else {
+				delay = min(2*delay, time.Second)
+			}
+			sink().printf("Connection error: %v (retrying in %s)\n", err, delay)
+			time.Sleep(delay)
+			continue
+		}
+		delay = 0
+
+		clientAddr := conn.RemoteAddr().String()
+		if cfg.maxClients > 0 && int(clientCount.Load()) >= cfg.maxClients {
+			sink().printf("Rejected client %s: max clients (%d) reached\n", clientAddr, cfg.maxClients)
+			conn.Close()
 			continue
 		}
 
-		switch cmd {
-		case "#send":
-			clientAddr, message := splitHead(rest)
-			if clientAddr == "" {
-				fmt.Println("Usage: #send <clientAddr> <message>")
-			} else {
-				sendToClient(&clients, clientAddr, message, sendTerminatorBytes, writeTimeout)
-			}
-		case "#broadcast":
-			broadcastToAll(&clients, rest, sendTerminatorBytes, writeTimeout)
-		case "#list":
-			listClients(&clients)
-		case "#help":
-			sub, _ := splitHead(rest)
-			if sub == "program" {
-				fullUsage()
-			} else {
-				printServerHelp()
-			}
-		case "#quit", "#exit":
-			fmt.Println("Shutting down server...")
-			shuttingDown.Store(true)
-			closeClients()
-			listener.Close()
-			return exitOK
-		default:
-			fmt.Printf("Unknown command: %s\n", cmd)
-			fmt.Println("Available commands: #send, #broadcast, #list, #help, #quit")
-		}
+		sink().clientConnected(clientAddr)
+		clients.Store(clientAddr, conn)
+		clientCount.Add(1)
 
-		printPrompt("Command> ")
+		if handlers != nil {
+			handlers.Add(1)
+		}
+		go func() {
+			if handlers != nil {
+				defer handlers.Done()
+			}
+			handleClient(conn, cfg)
+			clients.Delete(clientAddr)
+			clientCount.Add(-1)
+		}()
 	}
-	if err := scanner.Err(); err != nil {
-		fmt.Println("Input error:", err)
-		shuttingDown.Store(true)
-		closeClients()
-		listener.Close()
-		return exitIO
-	}
-	shuttingDown.Store(true)
-	closeClients()
-	listener.Close()
-	return exitOK
 }
 
-func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte, echoEnabled bool, bufferSize int, flushTimeout time.Duration, maxFrameSize int, writeTimeout time.Duration) {
-	defer conn.Close()
-	defer fmt.Printf("Client disconnected: %s\n", conn.RemoteAddr().String())
-
+func handleClient(conn net.Conn, cfg serverConfig) {
 	clientAddr := conn.RemoteAddr().String()
+	defer conn.Close()
+	defer func() { sink().clientDisconnected(clientAddr) }()
+
+	recvTerminatorBytes := cfg.recvTerminatorBytes
+	sendTerminatorBytes := cfg.sendTerminatorBytes
+	echoEnabled := cfg.echoEnabled
+	bufferSize := cfg.bufferSize
+	flushTimeout := cfg.flushTimeout
+	maxFrameSize := cfg.maxFrameSize
+	writeTimeout := cfg.writeTimeout
 
 	buffer := make([]byte, bufferSize)
 	var messageBuffer bytes.Buffer
@@ -697,7 +985,7 @@ func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte
 		if messageBuffer.Len() == 0 {
 			return
 		}
-		logServerData(clientAddr, "Received", colorGreen, messageBuffer.String(), messageBuffer.Bytes())
+		sink().serverFrame(clientAddr, "Received", colorGreen, messageBuffer.String(), messageBuffer.Bytes())
 		messageBuffer.Reset()
 	}
 
@@ -717,20 +1005,20 @@ func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte
 					return
 				}
 				fullFrame := message + string(recvTerminatorBytes)
-				logServerData(clientAddr, "Received", colorGreen, message, []byte(fullFrame))
+				sink().serverFrame(clientAddr, "Received", colorGreen, message, []byte(fullFrame))
 
 				if echoEnabled {
 					response := message + string(sendTerminatorBytes)
 					if err := writeConn(conn, []byte(response), writeTimeout); err != nil {
-						fmt.Printf("[%s] Send error: %v\n", clientAddr, err)
+						sink().printf("[%s] Send error: %v\n", clientAddr, err)
 						stopClient = true
 						return
 					}
-					logServerData(clientAddr, "Sent", colorRed, message, []byte(response))
+					sink().serverFrame(clientAddr, "Sent", colorRed, message, []byte(response))
 				}
 			})
 			if frameErr != nil {
-				fmt.Printf("[%s] %v (limit %d bytes)\n", clientAddr, frameErr, maxFrameSize)
+				sink().printf("[%s] %v (limit %d bytes)\n", clientAddr, frameErr, maxFrameSize)
 				return
 			}
 			if stopClient {
@@ -745,7 +1033,11 @@ func handleClient(conn net.Conn, recvTerminatorBytes, sendTerminatorBytes []byte
 
 		if err != nil {
 			flushIncomplete()
-			fmt.Printf("[%s] Receive error: %v\n", clientAddr, err)
+			// A peer that closes normally, or a connection this side closed
+			// (#quit, a failed write), is reported by clientDisconnected.
+			if !isClosedByPeer(err) && !errors.Is(err, net.ErrClosed) {
+				sink().printf("[%s] Receive error: %v\n", clientAddr, err)
+			}
 			break
 		}
 	}
@@ -763,17 +1055,17 @@ func sendToClient(clients *sync.Map, clientAddr string, message string, terminat
 
 	value, ok := clients.Load(clientAddr)
 	if !ok {
-		fmt.Printf("Client not found: %s\n", clientAddr)
+		sink().printf("Client not found: %s\n", clientAddr)
 		return
 	}
 	conn := value.(net.Conn)
 	response := processedMessage + string(terminatorBytes)
 	if err := writeConn(conn, []byte(response), writeTimeout); err != nil {
-		fmt.Printf("Send error [%s]: %v\n", clientAddr, err)
+		sink().printf("Send error [%s]: %v\n", clientAddr, err)
 		dropClient(clients, clientAddr, conn)
 		return
 	}
-	logServerData(clientAddr, "Sent", colorRed, message, []byte(response))
+	sink().serverFrame(clientAddr, "Sent", colorRed, message, []byte(response))
 }
 
 func broadcastToAll(clients *sync.Map, message string, terminatorBytes []byte, writeTimeout time.Duration) {
@@ -791,11 +1083,11 @@ func broadcastToAll(clients *sync.Map, message string, terminatorBytes []byte, w
 		go func(addr string, conn net.Conn) {
 			defer wg.Done()
 			if err := writeConn(conn, responseBytes, writeTimeout); err != nil {
-				fmt.Printf("Send error [%s]: %v\n", addr, err)
+				sink().printf("Send error [%s]: %v\n", addr, err)
 				dropClient(clients, addr, conn)
 				return
 			}
-			logServerData(addr, "Sent", colorRed, message, responseBytes)
+			sink().serverFrame(addr, "Sent", colorRed, message, responseBytes)
 			mu.Lock()
 			count++
 			mu.Unlock()
@@ -803,21 +1095,21 @@ func broadcastToAll(clients *sync.Map, message string, terminatorBytes []byte, w
 		return true
 	})
 	wg.Wait()
-	fmt.Printf("Broadcast completed: sent to %d clients\n", count)
+	sink().printf("Broadcast completed: sent to %d clients\n", count)
 }
 
 func listClients(clients *sync.Map) {
 	count := 0
-	fmt.Println("Connected clients:")
+	sink().printf("Connected clients:\n")
 	clients.Range(func(key, value interface{}) bool {
-		fmt.Printf("  %s\n", key)
+		sink().printf("  %s\n", key)
 		count++
 		return true
 	})
 	if count == 0 {
-		fmt.Println("  No clients connected")
+		sink().printf("  No clients connected\n")
 	} else {
-		fmt.Printf("Total: %d clients\n", count)
+		sink().printf("Total: %d clients\n", count)
 	}
 }
 
@@ -895,33 +1187,40 @@ type clientConfig struct {
 	bufferSize          int
 	maxFrameSize        int
 	writeTimeout        time.Duration
+	connectTimeout      time.Duration
 	flushTimeout        time.Duration
 	message             string
 	messageSet          bool
 	wait                time.Duration
 	waitSet             bool
 	quiet               bool
+	tui                 bool
+	logPath             string
+	color               colorChoice
 }
 
 func clientUsage() string {
-	return "Usage: -c, --client <IP> <port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T] [-m, --message <message>] [--wait <duration>] [--quiet] [--buffer-size <size>] [--max-frame-size <size>] [--write-timeout <duration>] [--flush-timeout <duration>] [--color] [--no-color]"
+	return "Usage: -c, --client <host> <port> | <host>:<port> [terminator] [-tt T] [-rt T] [--tx-term T] [--rx-term T] [-m, --message <message> [--wait <duration>] [--quiet]] [--connect-timeout <duration>] [--buffer-size <size>] [--max-frame-size <size>] [--write-timeout <duration>] [--flush-timeout <duration>] [--log <file>] [--tui] [--color] [--no-color]"
 }
 
 func parseClientConfig() (clientConfig, error) {
-	if len(os.Args) < 4 {
+	address, used, err := parseClientTarget(os.Args[2:])
+	if errors.Is(err, errMissingTarget) {
 		return clientConfig{}, fmt.Errorf("%s\nTerminator: LF, CR, or CRLF. Positional is optional if -tt and -rt specify send and receive.", clientUsage())
+	}
+	if err != nil {
+		return clientConfig{}, fmt.Errorf("Error: %w", err)
 	}
 
 	cfg := clientConfig{
-		address:      net.JoinHostPort(os.Args[2], os.Args[3]),
-		bufferSize:   defaultBufferSize,
-		maxFrameSize: defaultMaxFrameSize,
-		writeTimeout: defaultWriteTimeout,
+		address:        address,
+		bufferSize:     defaultBufferSize,
+		maxFrameSize:   defaultMaxFrameSize,
+		writeTimeout:   defaultWriteTimeout,
+		connectTimeout: defaultConnectTimeout,
 	}
-	colorEnabled = true
-	terminalControlEnabled = stdinIsTerminal()
 
-	argi := 4
+	argi := 2 + used
 	if argi < len(os.Args) && !strings.HasPrefix(os.Args[argi], "-") {
 		if !terminatorToken(os.Args[argi]) {
 			return clientConfig{}, fmt.Errorf("Error: Terminator must be LF, CR, or CRLF (or omit and use -tt / -rt)")
@@ -930,46 +1229,55 @@ func parseClientConfig() (clientConfig, error) {
 		argi++
 	}
 
+	value := func(i int, what string) (string, error) {
+		if i+1 >= len(os.Args) {
+			return "", fmt.Errorf("Error: %s must be specified after %s", what, os.Args[i])
+		}
+		return os.Args[i+1], nil
+	}
+
 	for i := argi; i < len(os.Args); i++ {
 		arg := os.Args[i]
+		var err error
+		var v string
 		switch arg {
 		case "--buffer-size":
-			if i+1 >= len(os.Args) {
-				return clientConfig{}, fmt.Errorf("Error: Buffer size must be specified after --buffer-size")
+			if v, err = value(i, "Buffer size"); err != nil {
+				return clientConfig{}, err
 			}
-			var err error
-			cfg.bufferSize, err = parseBufferSize(os.Args[i+1])
-			if err != nil {
+			if cfg.bufferSize, err = parseBufferSize(v); err != nil {
 				return clientConfig{}, fmt.Errorf("Error: %w", err)
 			}
 			i++
 		case "--max-frame-size":
-			if i+1 >= len(os.Args) {
-				return clientConfig{}, fmt.Errorf("Error: Max frame size must be specified after --max-frame-size")
+			if v, err = value(i, "Max frame size"); err != nil {
+				return clientConfig{}, err
 			}
-			var err error
-			cfg.maxFrameSize, err = parseMaxFrameSize(os.Args[i+1])
-			if err != nil {
+			if cfg.maxFrameSize, err = parseMaxFrameSize(v); err != nil {
 				return clientConfig{}, fmt.Errorf("Error: %w", err)
 			}
 			i++
 		case "--write-timeout":
-			if i+1 >= len(os.Args) {
-				return clientConfig{}, fmt.Errorf("Error: Write timeout must be specified after --write-timeout")
+			if v, err = value(i, "Write timeout"); err != nil {
+				return clientConfig{}, err
 			}
-			var err error
-			cfg.writeTimeout, err = parseWriteTimeout(os.Args[i+1])
-			if err != nil {
+			if cfg.writeTimeout, err = parseWriteTimeout(v); err != nil {
+				return clientConfig{}, fmt.Errorf("Error: %w", err)
+			}
+			i++
+		case "--connect-timeout":
+			if v, err = value(i, "Connect timeout"); err != nil {
+				return clientConfig{}, err
+			}
+			if cfg.connectTimeout, err = parseConnectTimeout(v); err != nil {
 				return clientConfig{}, fmt.Errorf("Error: %w", err)
 			}
 			i++
 		case "--flush-timeout":
-			if i+1 >= len(os.Args) {
-				return clientConfig{}, fmt.Errorf("Error: Flush timeout must be specified after --flush-timeout")
+			if v, err = value(i, "Flush timeout"); err != nil {
+				return clientConfig{}, err
 			}
-			var err error
-			cfg.flushTimeout, err = parseFlushTimeout(os.Args[i+1])
-			if err != nil {
+			if cfg.flushTimeout, err = parseFlushTimeout(v); err != nil {
 				return clientConfig{}, fmt.Errorf("Error: %w", err)
 			}
 			i++
@@ -993,25 +1301,35 @@ func parseClientConfig() (clientConfig, error) {
 			cfg.messageSet = true
 			i++
 		case "--wait":
-			if i+1 >= len(os.Args) {
-				return clientConfig{}, fmt.Errorf("Error: Wait duration must be specified after --wait")
+			if v, err = value(i, "Wait duration"); err != nil {
+				return clientConfig{}, err
 			}
-			var err error
-			cfg.wait, err = parseWaitDuration(os.Args[i+1])
-			if err != nil {
+			if cfg.wait, err = parseWaitDuration(v); err != nil {
 				return clientConfig{}, fmt.Errorf("Error: %w", err)
 			}
 			cfg.waitSet = true
 			i++
+		case "--log":
+			if v, err = value(i, "Log file"); err != nil {
+				return clientConfig{}, err
+			}
+			cfg.logPath = v
+			i++
 		case "--quiet":
 			cfg.quiet = true
+		case "--tui":
+			cfg.tui = true
 		case "--color":
-			colorEnabled = true
+			cfg.color = colorOn
 		case "--no-color":
-			colorEnabled = false
+			cfg.color = colorOff
 		default:
 			return clientConfig{}, fmt.Errorf("Error: Unknown option %s", arg)
 		}
+	}
+
+	if cfg.quiet && !cfg.messageSet {
+		return clientConfig{}, fmt.Errorf("Error: --quiet is only used with -m / --message")
 	}
 
 	if cfg.legacyTerminator != "" {
@@ -1029,7 +1347,6 @@ func parseClientConfig() (clientConfig, error) {
 		cfg.recvTerminatorName = "LF"
 	}
 
-	var err error
 	cfg.sendTerminatorBytes, err = parseTerminator(cfg.sendTerminatorName)
 	if err != nil {
 		return clientConfig{}, fmt.Errorf("Error (-tt / --tx-term): %w", err)
@@ -1041,27 +1358,60 @@ func parseClientConfig() (clientConfig, error) {
 	return cfg, nil
 }
 
-func runClient() {
-	_ = runClientWithExitCode()
-}
-
 func runClientWithExitCode() int {
 	cfg, err := parseClientConfig()
 	if err != nil {
-		output := io.Writer(os.Stdout)
-		for _, arg := range os.Args {
-			if arg == "--quiet" {
-				output = os.Stderr
-				break
-			}
-		}
-		fmt.Fprintln(output, err)
+		errorf("%v\n", err)
 		return exitUsage
 	}
+	if cfg.messageSet && cfg.tui {
+		errorf("Error: --tui cannot be used with -m / --message\n")
+		return exitUsage
+	}
+	// Without -m, --wait limits how long piped input waits for replies.
+	if cfg.waitSet && !cfg.messageSet && (cfg.tui || stdinIsTerminal()) {
+		errorf("Error: --wait is only used with -m / --message or with piped input\n")
+		return exitUsage
+	}
+	if cfg.tui && !tuiAvailable() {
+		errorf("Error: --tui requires a terminal\n")
+		return exitUsage
+	}
+	logOut := os.Stdout
+	if cfg.quiet {
+		logOut = os.Stderr
+	}
+	colorEnabled = resolveColor(cfg.color, logOut)
+	colorMode = cfg.color
+	terminalControlEnabled = promptRedrawAvailable()
+
+	if cfg.logPath != "" {
+		closer, err := openLogFile(cfg.logPath)
+		if err != nil {
+			errorf("Error: cannot open log file: %v\n", err)
+			return exitIO
+		}
+		defer func() {
+			setLogWriter(nil)
+			closer.Close()
+		}()
+		logEventf("coe %s client connecting to %s", version, cfg.address)
+	}
+
 	if cfg.messageSet {
 		return runOneShotClient(cfg)
 	}
+	if cfg.tui {
+		return runClientTUI(cfg)
+	}
 	return runInteractiveClient(cfg)
+}
+
+// dialServer connects with the configured timeout so that an address that
+// drops packets fails in seconds rather than after the OS default (minutes).
+func dialServer(cfg clientConfig) (net.Conn, error) {
+	d := net.Dialer{Timeout: cfg.connectTimeout}
+	return d.Dial("tcp", cfg.address)
 }
 
 func printClientConnectionInfo(w io.Writer, cfg clientConfig) {
@@ -1092,9 +1442,9 @@ func runOneShotClient(cfg clientConfig) int {
 		logWriter = os.Stderr
 	}
 
-	conn, err := net.Dial("tcp", cfg.address)
+	conn, err := dialServer(cfg)
 	if err != nil {
-		fmt.Fprintln(logWriter, "Connection error:", err)
+		errorf("Connection error: %v\n", err)
 		return exitIO
 	}
 	defer conn.Close()
@@ -1104,13 +1454,13 @@ func runOneShotClient(cfg clientConfig) int {
 	processedText := processEscapeSequences(cfg.message)
 	frame := []byte(processedText + string(cfg.sendTerminatorBytes))
 	if err := writeConn(conn, frame, cfg.writeTimeout); err != nil {
-		fmt.Fprintln(logWriter, "Send error:", err)
-		return 2
+		errorf("Send error: %v\n", err)
+		return exitUsage
 	}
 	logClientDataTo(logWriter, "Send", colorCyan, cfg.message, frame)
 
 	if !cfg.waitSet {
-		return 0
+		return exitOK
 	}
 	return waitForOneShotResponses(conn, cfg, logWriter)
 }
@@ -1127,6 +1477,7 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 			// A newline separates multiple response frames while keeping stdout
 			// free of connection metadata and timestamped logs.
 			fmt.Fprintln(os.Stdout, message)
+			logLine(formatClientLine(logTimestamp(), "Recv", colorGreen, message, raw, false))
 			return
 		}
 		logClientDataTo(logWriter, "Recv", colorGreen, message, raw)
@@ -1154,7 +1505,7 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 			}
 		}
 		if err := conn.SetReadDeadline(readDeadline); err != nil {
-			fmt.Fprintln(logWriter, "Receive error:", err)
+			errorf("Receive error: %v\n", err)
 			return exitIO
 		}
 
@@ -1166,7 +1517,7 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 				fullFrame := append([]byte(message), cfg.recvTerminatorBytes...)
 				emit(message, fullFrame)
 			}); frameErr != nil {
-				fmt.Fprintln(logWriter, "Receive error:", frameErr)
+				errorf("Receive error: %v\n", frameErr)
 				return exitIO
 			}
 		}
@@ -1185,7 +1536,7 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 			continue
 		}
 		if err != io.EOF {
-			fmt.Fprintln(logWriter, "Receive error:", err)
+			errorf("Receive error: %v\n", err)
 			flushIncomplete()
 			return exitIO
 		}
@@ -1194,36 +1545,46 @@ func waitForOneShotResponses(conn net.Conn, cfg clientConfig, logWriter io.Write
 	}
 
 	if !received {
-		fmt.Fprintf(logWriter, "No response received within %s\n", cfg.wait)
+		discardOrphanLFAfterCR(&messageBuffer, cfg.recvTerminatorBytes)
+		if messageBuffer.Len() > 0 {
+			fmt.Fprintf(logWriter, "No response received within %s (%d bytes arrived without the %s terminator; use --flush-timeout to show them)\n",
+				cfg.wait, messageBuffer.Len(), strings.ToUpper(cfg.recvTerminatorName))
+		} else {
+			fmt.Fprintf(logWriter, "No response received within %s\n", cfg.wait)
+		}
 		return exitNoResponse
 	}
 	return exitOK
 }
 
 func runInteractiveClient(cfg clientConfig) int {
-	conn, err := net.Dial("tcp", cfg.address)
+	conn, err := dialServer(cfg)
 	if err != nil {
-		fmt.Println("Connection error:", err)
+		errorf("Connection error: %v\n", err)
 		return exitIO
 	}
 	defer conn.Close()
 
 	printClientConnectionInfo(os.Stdout, cfg)
-	fmt.Println("Chat started. Enter messages:")
+	fmt.Println("Chat started. Enter messages (an empty line sends just the terminator):")
 	fmt.Println("----------------------------------------")
+	setPrompt("Send> ")
 
 	var clientClosing atomic.Bool
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 	go func() {
-		<-sigChan
-		fmt.Println("\nDisconnecting...")
+		if _, ok := <-sigChan; !ok {
+			return
+		}
+		hidePrompt()
+		lineOutput(func() { fmt.Println("Disconnecting...") })
 		clientClosing.Store(true)
 		conn.Close()
 		os.Exit(0)
 	}()
 
-	var outputMutex sync.Mutex
 	recvDone := make(chan error, 1)
 	go func() {
 		var result error
@@ -1232,20 +1593,16 @@ func runInteractiveClient(cfg clientConfig) int {
 		var messageBuffer bytes.Buffer
 		var pendingSkipLF bool
 
-		flushIncomplete := func(withPrompt bool) {
+		flushIncomplete := func() {
 			if discardOrphanLFAfterCR(&messageBuffer, cfg.recvTerminatorBytes) {
 				return
 			}
 			if messageBuffer.Len() == 0 {
 				return
 			}
-			outputMutex.Lock()
-			clearInputLine()
-			logClientData("Recv", colorGreen, messageBuffer.String(), messageBuffer.Bytes())
-			if withPrompt {
-				printPrompt("Send> ")
-			}
-			outputMutex.Unlock()
+			raw := append([]byte(nil), messageBuffer.Bytes()...)
+			text := messageBuffer.String()
+			lineOutput(func() { logClientData("Recv", colorGreen, text, raw) })
 			messageBuffer.Reset()
 		}
 
@@ -1260,27 +1617,22 @@ func runInteractiveClient(cfg clientConfig) int {
 			if n > 0 {
 				data := buffer[:n]
 				if frameErr := appendAndFlushBySuffix(&messageBuffer, data, cfg.recvTerminatorBytes, &pendingSkipLF, cfg.maxFrameSize, func(message string) {
-					fullFrame := message + string(cfg.recvTerminatorBytes)
-					outputMutex.Lock()
-					clearInputLine()
-					logClientData("Recv", colorGreen, message, []byte(fullFrame))
-					printPrompt("Send> ")
-					outputMutex.Unlock()
+					fullFrame := []byte(message + string(cfg.recvTerminatorBytes))
+					lineOutput(func() { logClientData("Recv", colorGreen, message, fullFrame) })
 				}); frameErr != nil {
 					if clientClosing.Load() {
 						return
 					}
-					outputMutex.Lock()
-					clearInputLine()
-					fmt.Println("Receive error:", frameErr)
-					outputMutex.Unlock()
+					hidePrompt()
+					lineOutput(func() { errorf("Receive error: %v\n", frameErr) })
+					logEventf("Receive error: %v", frameErr)
 					result = frameErr
 					return
 				}
 			}
 
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				flushIncomplete(true)
+				flushIncomplete()
 				continue
 			}
 
@@ -1288,51 +1640,52 @@ func runInteractiveClient(cfg clientConfig) int {
 				if clientClosing.Load() {
 					return
 				}
-				flushIncomplete(false)
-				outputMutex.Lock()
-				clearInputLine()
-				fmt.Println("Receive error:", err)
-				outputMutex.Unlock()
-				if !errors.Is(err, io.EOF) {
-					result = err
+				flushIncomplete()
+				hidePrompt()
+				if isClosedByPeer(err) {
+					lineOutput(func() { fmt.Println("Connection closed by peer") })
+					logEventf("Connection closed by peer")
+					return
 				}
+				lineOutput(func() { errorf("Receive error: %v\n", err) })
+				logEventf("Receive error: %v", err)
+				result = err
 				return
 			}
 		}
 	}()
 
 	sendDone := make(chan error, 1)
+	stdin := os.Stdin // read once; the goroutines may outlive this call
 	go func() {
 		var result error
 		defer func() { sendDone <- result }()
-		scanner := bufio.NewScanner(os.Stdin)
+		scanner := bufio.NewScanner(stdin)
 		scanner.Buffer(make([]byte, 1024), 1024*1024)
-		printPrompt("Send> ")
+		showPrompt()
 		for scanner.Scan() {
+			promptConsumed()
 			if clientClosing.Load() {
 				return
 			}
+			// An empty line is sent as a bare terminator (an empty frame).
 			text := scanner.Text()
-			if text == "" {
-				printPrompt("Send> ")
-				continue
-			}
-
 			processedText := processEscapeSequences(text)
 			message := []byte(processedText + string(cfg.sendTerminatorBytes))
 			if err := writeConn(conn, message, cfg.writeTimeout); err != nil {
-				fmt.Println("Send error:", err)
+				if clientClosing.Load() {
+					return
+				}
+				lineOutput(func() { errorf("Send error: %v\n", err) })
+				logEventf("Send error: %v", err)
 				result = err
 				return
 			}
-
-			outputMutex.Lock()
-			logClientData("Send", colorCyan, text, message)
-			printPrompt("Send> ")
-			outputMutex.Unlock()
+			lineOutput(func() { logClientData("Send", colorCyan, text, message) })
+			showPrompt()
 		}
 		if err := scanner.Err(); err != nil && !clientClosing.Load() {
-			fmt.Println("Input error:", err)
+			lineOutput(func() { errorf("Input error: %v\n", err) })
 			result = err
 		}
 	}()
@@ -1342,9 +1695,34 @@ func runInteractiveClient(cfg clientConfig) int {
 	case recvErr = <-recvDone:
 		clientClosing.Store(true)
 		conn.Close()
-		_ = os.Stdin.Close()
-		sendErr = <-sendDone
+		// The input goroutine may be blocked reading stdin, and closing stdin
+		// does not reliably unblock it (on Windows the close itself waits for a
+		// pending console read). Do not wait for it beyond a moment: the
+		// process exits right after this returns, which ends that goroutine.
+		go func() { _ = stdin.Close() }()
+		select {
+		case sendErr = <-sendDone:
+		case <-time.After(100 * time.Millisecond):
+		}
 	case sendErr = <-sendDone:
+		if sendErr == nil && !stdinIsTerminal() && halfClose(conn) {
+			// Piped input ended. The write side is closed so the peer sees
+			// EOF, but replies to the last lines are still read until the
+			// peer closes the connection, or for --wait if it was given.
+			var limit <-chan time.Time
+			if cfg.waitSet {
+				limit = time.After(cfg.wait)
+			}
+			select {
+			case recvErr = <-recvDone:
+				clientClosing.Store(true)
+			case <-limit:
+				clientClosing.Store(true)
+				conn.Close()
+				<-recvDone
+			}
+			break
+		}
 		clientClosing.Store(true)
 		conn.Close()
 		recvErr = <-recvDone
@@ -1353,4 +1731,11 @@ func runInteractiveClient(cfg clientConfig) int {
 		return exitIO
 	}
 	return exitOK
+}
+
+// halfClose shuts down the sending side of a TCP connection and reports
+// whether that worked.
+func halfClose(conn net.Conn) bool {
+	cw, ok := conn.(interface{ CloseWrite() error })
+	return ok && cw.CloseWrite() == nil
 }
