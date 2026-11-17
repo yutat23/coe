@@ -482,7 +482,7 @@ func runServerTUI(cfg serverConfig, listener net.Listener) int {
 	s.start(p)
 	setSink(s)
 
-	go acceptClients(listener, cfg, &clients, &clientCount, &shuttingDown)
+	go acceptClients(listener, cfg, &clients, &clientCount, &shuttingDown, nil)
 
 	_, err := p.Run()
 	// Connection goroutines may outlive the program; keep them off the
