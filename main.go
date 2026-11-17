@@ -20,7 +20,7 @@ import (
 
 // version is the single source of the release number. build.ps1 reads it
 // from here; a build can still override it with -ldflags "-X main.version=...".
-var version = "0.1.9"
+var version = "0.1.10"
 
 const (
 	defaultBufferSize     = 1024
